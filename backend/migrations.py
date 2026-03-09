@@ -1,4 +1,3 @@
-
 """Database migration system for schema upgrades"""
 import sqlite3
 import os
@@ -9,7 +8,7 @@ class DatabaseMigration:
     """Handle database schema migrations"""
 
     VERSION_TABLE = 'schema_version'
-    CURRENT_VERSION = 3  # Version 3 includes watchlist tables
+    CURRENT_VERSION = 4  # Version 3 includes watchlist tables # Version 4 adds sentiment_signed_score
     
     def __init__(self, db_path='finance_sentiment.db'):
         """
@@ -66,26 +65,49 @@ class DatabaseMigration:
         """
         return self.get_current_version() < self.CURRENT_VERSION
 
+    # def run_migrations(self):
+    #     """
+    #     Run all necessary migrations to bring database to current version
+    #     """
+    #     current_version = self.get_current_version()
+
+    #     if current_version == 0:
+    #         print("Initializing new database with schema version 3...")
+    #         self._create_v3_schema()
+    #     elif current_version == 1:
+    #         print("Migrating database from version 1 to 3...")
+    #         self._migrate_v1_to_v2()
+    #         self._migrate_v2_to_v3()
+    #     elif current_version == 2:
+    #         print("Migrating database from version 2 to 3...")
+    #         self._migrate_v2_to_v3()
+    #     elif current_version == self.CURRENT_VERSION:
+    #         print("Database is already at current version")
+    #     else:
+    #         raise Exception(f"Unknown database version: {current_version}")
     def run_migrations(self):
-        """
-        Run all necessary migrations to bring database to current version
-        """
         current_version = self.get_current_version()
 
         if current_version == 0:
-            print("Initializing new database with schema version 3...")
-            self._create_v3_schema()
+            print("Initializing new database with schema version 4...")
+            self._create_v4_schema()
         elif current_version == 1:
-            print("Migrating database from version 1 to 3...")
+            print("Migrating database from version 1 to 4...")
             self._migrate_v1_to_v2()
             self._migrate_v2_to_v3()
+            self._migrate_v3_to_v4()
         elif current_version == 2:
-            print("Migrating database from version 2 to 3...")
+            print("Migrating database from version 2 to 4...")
             self._migrate_v2_to_v3()
+            self._migrate_v3_to_v4()
+        elif current_version == 3:
+            print("Migrating database from version 3 to 4...")
+            self._migrate_v3_to_v4()
         elif current_version == self.CURRENT_VERSION:
             print("Database is already at current version")
         else:
             raise Exception(f"Unknown database version: {current_version}")
+
 
     def _create_v2_schema(self):
         """Create complete version 2 schema from scratch"""
@@ -465,3 +487,32 @@ class DatabaseMigration:
             
             # Update schema version
             cursor.execute(f'UPDATE {self.VERSION_TABLE} SET version = ?', (3,))
+
+
+
+    def _migrate_v3_to_v4(self):
+        """Migrate from version 3 to version 4 (add sentiment_signed_score column)"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Check existing columns
+            cursor.execute("PRAGMA table_info(posts)")
+            columns = {row['name'] for row in cursor.fetchall()}
+
+            if 'sentiment_signed_score' not in columns:
+                cursor.execute("ALTER TABLE posts ADD COLUMN sentiment_signed_score REAL")
+                print("Added column sentiment_signed_score to posts table")
+            else:
+                print("Column sentiment_signed_score already exists")
+
+            # Update schema version to 4
+            cursor.execute(f'UPDATE {self.VERSION_TABLE} SET version = ?', (4,))
+            print("Database migrated to version 4 successfully")
+
+    def _create_v4_schema(self):
+        """Create complete version 4 schema from scratch"""
+        # create v3 schema first
+        self._create_v3_schema()
+
+        # then add v4 changes
+        self._migrate_v3_to_v4()

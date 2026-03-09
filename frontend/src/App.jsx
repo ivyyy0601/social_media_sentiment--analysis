@@ -1,4 +1,3 @@
-
 import React, { useState, useEffect } from 'react'
 import axios from 'axios'
 import Dashboard from './components/Dashboard'
@@ -17,6 +16,8 @@ import ErrorMessage from './components/ErrorMessage'
 import ExportMenu from './components/ExportMenu'
 import WatchlistPanel from './components/WatchlistPanel'
 import FetchControls from './components/FetchControls'
+import AIAnalyst from './components/AIAnalyst'
+import TickerBoard from './components/TickerBoard'
 
 function App() {
   const [posts, setPosts] = useState([])
@@ -117,7 +118,7 @@ function App() {
       const [postsRes, statsRes, trendsRes] = await Promise.all([
         axios.get(`${API_BASE}/api/v1/posts?limit=20&${filterParams}`),
         axios.get(`${API_BASE}/api/v1/stats?${filterParams}`),
-        axios.get(`${API_BASE}/api/v1/trends?days=7&${filterParams}`)
+        axios.get(`${API_BASE}/api/v1/trends?days=30&${filterParams}`)
       ])
 
       if (postsRes.data.success) {
@@ -343,6 +344,18 @@ function App() {
         >
           Posts
         </button>
+        <button
+          className={`tab ${activeView === 'leaderboard' ? 'active' : ''}`}
+          onClick={() => setActiveView('leaderboard')}
+        >
+          📊 Leaderboard
+        </button>
+        <button
+          className={`tab ${activeView === 'ai' ? 'active' : ''}`}
+          onClick={() => setActiveView('ai')}
+        >
+          🤖 AI Analyst
+        </button>
       </div>
 
       {/* Content based on active view */}
@@ -352,6 +365,16 @@ function App() {
           <Dashboard stats={stats} onFetchPosts={fetchNewPosts} />
           <SentimentChart trends={trends} title="Sentiment Trends Over Time" />
         </>
+      )}
+
+      {activeView === 'leaderboard' && (
+        <TickerBoard
+          apiBase={API_BASE}
+          onTickerSelect={(ticker) => {
+            setSelectedTickers([ticker])
+            setActiveView('overview')
+          }}
+        />
       )}
 
       {activeView === 'analytics' && (
@@ -366,6 +389,10 @@ function App() {
 
       {activeView === 'posts' && (
         <PostsList posts={posts} onFetchPosts={fetchNewPosts} />
+      )}
+
+      {activeView === 'ai' && (
+        <AIAnalyst apiBase={API_BASE} />
       )}
     </div>
   )

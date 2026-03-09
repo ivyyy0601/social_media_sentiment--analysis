@@ -10,6 +10,7 @@ from stock_data_provider import StockDataProvider
 from price_data_provider import PriceDataProvider
 from export_service import ExportService
 from watchlist_repository import WatchlistRepository
+from agent_service import AgentService
 from api_utils import (
     success_response, error_response, paginated_response,
     validate_pagination_params, validate_date_param, validate_enum_param
@@ -17,6 +18,13 @@ from api_utils import (
 import os
 import json
 from datetime import datetime
+from alphavantage_news_client import AlphaVantageNewsClient
+from stocktwits_client import StockTwitsClient
+from yahoo_finance_news_client import YahooFinanceNewsClient
+from google_news_client import GoogleNewsClient
+from apscheduler.schedulers.background import BackgroundScheduler
+from whatsapp_service import WhatsAppService
+
 
 # Configure Flask to serve static files from frontend build
 static_folder = os.path.join(os.path.dirname(__file__), '..', 'frontend', 'dist')
@@ -27,7 +35,14 @@ def load_config():
     try:
         config_path = os.path.join(os.path.dirname(__file__), 'config.json')
         with open(config_path, 'r') as f:
-            return json.load(f)
+            raw = f.read()
+        # Replace ${ENV_VAR} placeholders with actual environment variables
+        import re
+        def replace_env(match):
+            var = match.group(1)
+            return os.environ.get(var, match.group(0))
+        raw = re.sub(r'\$\{(\w+)\}', replace_env, raw)
+        return json.loads(raw)
     except Exception as e:
         print(f"Warning: Could not load config.json: {e}")
         return {'server': {'port': 5000, 'debug': True, 'cors_origins': ['http://localhost:5173', 'http://localhost:3000']}}
@@ -50,6 +65,12 @@ else:
 # Initialize components
 sentiment_analyzer = SentimentAnalyzer()
 reddit_client = RedditRSSClient()
+try:
+    news_client = AlphaVantageNewsClient()
+except Exception as e:
+    print(f"[WARN] News client disabled: {e}")
+    news_client = None
+
 db = Database()
 ticker_extractor = TickerExtractor()
 industry_classifier = IndustryClassifier()
@@ -57,6 +78,232 @@ stock_data_provider = StockDataProvider()
 price_data_provider = PriceDataProvider()
 export_service = ExportService()
 watchlist_repo = WatchlistRepository()
+stocktwits_client = StockTwitsClient()
+yahoo_news_client = YahooFinanceNewsClient()
+google_news_client = GoogleNewsClient()
+
+# WhatsApp service
+wa_cfg = config.get('whatsapp', {})
+whatsapp_service = None
+if wa_cfg.get('enabled') and wa_cfg.get('phone') and wa_cfg.get('api_key'):
+    whatsapp_service = WhatsAppService(wa_cfg['phone'], wa_cfg['api_key'])
+    print(f"[WhatsApp] Notifications enabled → {wa_cfg['phone']}")
+
+# AI Agent (Gemini)
+groq_cfg = config.get('groq', {})
+groq_api_key = groq_cfg.get('api_key', '')
+groq_model = groq_cfg.get('model', 'llama-3.3-70b-versatile')
+agent_service = None
+if groq_api_key:
+    try:
+        agent_service = AgentService(db, price_data_provider, groq_api_key, groq_model, stock_data_provider)
+        print("AI Agent initialized (Groq)")
+    except Exception as e:
+        print(f"[WARN] AI Agent disabled: {e}")
+
+# ── Auto-fetch scheduler ──────────────────────────────────────────────────────
+AUTO_FETCH_TICKERS = config.get('auto_fetch', {}).get(
+    'tickers',
+    ['NVDA', 'AAPL', 'MSFT', 'GOOG', 'AMZN', 'META', 'TSLA',
+     'AVGO', 'TXN', 'COHR', 'INTC', 'ASML', 'SNDK']
+)
+AUTO_FETCH_INTERVAL_HOURS = config.get('auto_fetch', {}).get('interval_hours', 4)
+_last_auto_fetch = None
+_next_auto_fetch = None
+
+
+def _process_and_save_post(post):
+    """Analyze sentiment and save a single post to DB."""
+    sentiment = sentiment_analyzer.analyze(post['text'])
+    post['sentiment'] = sentiment
+    post_id = db.posts.save_post(post)
+    tickers_found = ticker_extractor.extract_tickers(post['text'])
+    classification = industry_classifier.classify_post_tickers(tickers_found)
+    for t in tickers_found:
+        info = industry_classifier.get_ticker_info(t) or {}
+        db.tickers.save_ticker(t, info.get('company'), info.get('sector'), info.get('industry'))
+    if tickers_found:
+        db.tickers.link_post_to_tickers(post_id, tickers_found)
+        db.tickers.link_post_to_industries_and_sectors(
+            post_id, classification['industries'], classification['sectors']
+        )
+
+
+def send_whatsapp_digest():
+    """Send daily WhatsApp digest with sentiment + price + AI analysis."""
+    if not whatsapp_service:
+        return
+    try:
+        import yfinance as yf
+        from datetime import datetime as dt
+
+        today = dt.now().strftime('%b %d, %Y')
+
+        # 1. Build sentiment board for all tickers
+        board = []
+        for ticker in AUTO_FETCH_TICKERS:
+            trends = db.analytics.get_sentiment_trends(days=7, ticker=ticker)
+            pos = sum(t.get('positive', 0) for t in trends)
+            neg = sum(t.get('negative', 0) for t in trends)
+            neu = sum(t.get('neutral', 0) for t in trends)
+            total = pos + neg + neu
+            score = round((pos - neg) / total, 3) if total > 0 else None
+            label = 'no_data' if score is None else ('bullish' if score > 0.1 else ('bearish' if score < -0.1 else 'neutral'))
+            info = industry_classifier.get_ticker_info(ticker) or {}
+
+            # Get price from yfinance
+            price = None
+            change = None
+            try:
+                p = price_data_provider.get_current_price(ticker)
+                if p:
+                    price = p.get('price')
+                    change = p.get('change_percent')
+            except: pass
+
+            board.append({
+                'ticker': ticker,
+                'company': info.get('company', ticker),
+                'score': score,
+                'label': label,
+                'total_posts': total,
+                'price': price,
+                'change': change,
+            })
+
+        board.sort(key=lambda x: (x['score'] is None, -(x['score'] or 0)))
+        has_data = [t for t in board if t['total_posts'] > 0]
+        no_data  = [t for t in board if t['total_posts'] == 0]
+
+        # 2. Get AI market brief (one call for overall analysis)
+        ai_brief = ''
+        if agent_service:
+            try:
+                ai_brief = agent_service.get_brief()
+                # Trim to keep WhatsApp message short
+                if len(ai_brief) > 500:
+                    ai_brief = ai_brief[:497] + '...'
+            except: pass
+
+        # 3. Format WhatsApp message
+        lines = [f"📊 *Sentiment Digest — {today}*", ""]
+
+        # AI brief
+        if ai_brief:
+            lines.append("*🤖 AI Market Brief:*")
+            lines.append(ai_brief)
+            lines.append("")
+
+        # Top movers (bullish)
+        bullish = [t for t in has_data if t['label'] == 'bullish'][:3]
+        if bullish:
+            lines.append("*🟢 Top Bullish:*")
+            for t in bullish:
+                price_str = f"${t['price']:.2f}" if t['price'] else 'N/A'
+                change_str = f"({t['change']:+.1f}%)" if t['change'] is not None else ''
+                lines.append(f"  {t['ticker']} {price_str} {change_str} | score: {t['score']:+.3f} | {t['total_posts']} posts")
+            lines.append("")
+
+        # Top movers (bearish)
+        bearish = [t for t in has_data if t['label'] == 'bearish'][:3]
+        if bearish:
+            lines.append("*🔴 Top Bearish:*")
+            for t in bearish:
+                price_str = f"${t['price']:.2f}" if t['price'] else 'N/A'
+                change_str = f"({t['change']:+.1f}%)" if t['change'] is not None else ''
+                lines.append(f"  {t['ticker']} {price_str} {change_str} | score: {t['score']:+.3f} | {t['total_posts']} posts")
+            lines.append("")
+
+        # Neutral
+        neutral = [t for t in has_data if t['label'] == 'neutral']
+        if neutral:
+            lines.append("*➡️ Neutral:* " + ', '.join(t['ticker'] for t in neutral))
+            lines.append("")
+
+        # No data
+        if no_data:
+            lines.append("*⚪ No data:* " + ', '.join(t['ticker'] for t in no_data))
+            lines.append("")
+
+        lines.append("_Your Sentiment Dashboard_")
+
+        message = '\n'.join(lines)
+        whatsapp_service.send(message)
+        print("[WhatsApp] Daily digest sent")
+    except Exception as e:
+        print(f"[WhatsApp] Digest failed: {e}")
+
+
+def auto_fetch_all_tickers():
+    """Background job: fetch Reddit + StockTwits + Yahoo News for all focus tickers."""
+    global _last_auto_fetch, _next_auto_fetch
+    print(f"[Scheduler] Auto-fetch started for {len(AUTO_FETCH_TICKERS)} tickers")
+    total_new = 0
+
+    for ticker in AUTO_FETCH_TICKERS:
+        posts = []
+        # Reddit
+        try:
+            posts += reddit_client.fetch_posts(ticker, max_results=100)
+        except Exception as e:
+            print(f"[Scheduler] Reddit {ticker}: {e}")
+        # StockTwits
+        try:
+            posts += stocktwits_client.fetch_posts(ticker, limit=30)
+        except Exception as e:
+            print(f"[Scheduler] StockTwits {ticker}: {e}")
+        # Yahoo Finance News
+        try:
+            posts += yahoo_news_client.fetch_posts(ticker, limit=30)
+        except Exception as e:
+            print(f"[Scheduler] YahooNews {ticker}: {e}")
+        # Google News
+        try:
+            posts += google_news_client.fetch_posts(ticker, limit=40)
+        except Exception as e:
+            print(f"[Scheduler] GoogleNews {ticker}: {e}")
+
+        for post in posts:
+            try:
+                _process_and_save_post(post)
+                total_new += 1
+            except Exception:
+                pass
+
+    _last_auto_fetch = datetime.utcnow().isoformat()
+    from datetime import timedelta
+    _next_auto_fetch = (
+        datetime.utcnow() + timedelta(hours=AUTO_FETCH_INTERVAL_HOURS)
+    ).isoformat()
+    print(f"[Scheduler] Done — processed {total_new} posts")
+
+
+# Start the scheduler (skip in testing environments)
+_scheduler = None
+if not os.environ.get('DISABLE_SCHEDULER'):
+    try:
+        _scheduler = BackgroundScheduler(daemon=True)
+        _scheduler.add_job(
+            auto_fetch_all_tickers,
+            'interval',
+            hours=AUTO_FETCH_INTERVAL_HOURS,
+            id='auto_fetch',
+            replace_existing=True
+        )
+        # Daily WhatsApp digest
+        digest_hour = config.get('whatsapp', {}).get('digest_hour', 8)
+        _scheduler.add_job(
+            send_whatsapp_digest,
+            'cron',
+            hour=digest_hour,
+            minute=0,
+            id='whatsapp_digest',
+            replace_existing=True
+        )
+        _scheduler.start()
+        print(f"[Scheduler] Auto-fetch every {AUTO_FETCH_INTERVAL_HOURS}h | WhatsApp digest at {digest_hour}:00")
+    except Exception as e:
+        print(f"[WARN] Scheduler disabled: {e}")
 
 # V1 API Endpoints
 @app.route('/api/v1/health', methods=['GET'])
@@ -112,8 +359,79 @@ def fetch_posts():
         return jsonify(*error_response('INVALID_PARAM', str(e)))
 
     try:
-        posts = reddit_client.fetch_posts(query, max_results, start_date, end_date)
+        posts = []
+
+        # 1️⃣ Reddit（永远都抓）
+        reddit_posts = reddit_client.fetch_posts(
+            query, max_results, start_date, end_date
+        )
+        posts.extend(reddit_posts)
+
+        # 2️⃣ News（只在 query 像 ticker 时才抓）
+        if news_client:
+            q = (query or "").strip().upper()
+
+            # 判断是不是股票代码，例如 NVDA / AAPL / NVDA,TSLA
+            looks_like_ticker = (
+                "," in q or
+                (q.isalnum() and 1 <= len(q) <= 5)
+            )
+
+            if looks_like_ticker:
+                try:
+                    news_posts = news_client.fetch_posts(
+                        tickers=q,
+                        limit=min(200, max_results)
+                    )
+                    posts.extend(news_posts)
+                except Exception as e:
+                    print(f"[WARN] News fetch failed: {e}")
+
+        # 3️⃣ StockTwits + Yahoo Finance News（只在 query 像单个 ticker 时才抓）
+        q = (query or "").strip().upper()
+        is_single_ticker = q.isalnum() and 1 <= len(q) <= 5
+
+        if is_single_ticker:
+            # StockTwits
+            try:
+                st_posts = stocktwits_client.fetch_posts(q, limit=30)
+                posts.extend(st_posts)
+                print(f"[StockTwits] {len(st_posts)} posts for {q}")
+            except Exception as e:
+                print(f"[WARN] StockTwits fetch failed: {e}")
+
+            # Yahoo Finance News
+            try:
+                yf_posts = yahoo_news_client.fetch_posts(q, limit=30)
+                posts.extend(yf_posts)
+                print(f"[YahooNews] {len(yf_posts)} posts for {q}")
+            except Exception as e:
+                print(f"[WARN] Yahoo Finance News fetch failed: {e}")
+
+            # Google News
+            try:
+                gn_posts = google_news_client.fetch_posts(q, limit=40)
+                posts.extend(gn_posts)
+                print(f"[GoogleNews] {len(gn_posts)} posts for {q}")
+            except Exception as e:
+                print(f"[WARN] Google News fetch failed: {e}")
+
+        # 4) 去重（按 url 优先）
+        seen = set()
+        deduped = []
+        for p in posts:
+            key = p.get("url") or p.get("id")
+            if not key:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(p)
+
+        posts = deduped[:max_results]
+
         analyzed_posts = []
+
 
         for post in posts:
             # Analyze sentiment
@@ -730,6 +1048,274 @@ def remove_ticker_from_watchlist(watchlist_id, ticker):
             return jsonify(*error_response('NOT_FOUND', 'Ticker not found in watchlist', 404))
     except Exception as e:
         return jsonify(*error_response('WATCHLIST_ERROR', str(e), 500))
+
+@app.route('/api/v1/ticker-detail/<ticker>', methods=['GET'])
+def get_ticker_detail(ticker):
+    """Return combined sentiment + yfinance data for a ticker."""
+    from datetime import datetime, timedelta
+    ticker = ticker.upper().strip()
+    days = int(request.args.get('days', 7))
+    try:
+        # Sentiment from DB
+        trends = db.analytics.get_sentiment_trends(days=days, ticker=ticker)
+        total_pos = sum(t.get('positive', 0) for t in trends)
+        total_neg = sum(t.get('negative', 0) for t in trends)
+        total_neu = sum(t.get('neutral', 0) for t in trends)
+        total = total_pos + total_neg + total_neu
+        score = round((total_pos - total_neg) / total, 3) if total > 0 else None
+        if score is None: label = 'no_data'
+        elif score > 0.1: label = 'bullish'
+        elif score < -0.1: label = 'bearish'
+        else: label = 'neutral'
+
+        # Daily sentiment scores for chart (sorted oldest → newest)
+        daily = []
+        for t in sorted(trends, key=lambda x: x.get('date', '')):
+            pos = t.get('positive', 0)
+            neg = t.get('negative', 0)
+            neu = t.get('neutral', 0)
+            tot = pos + neg + neu
+            daily_score = round((pos - neg) / tot, 3) if tot > 0 else None
+            daily.append({
+                'date': t.get('date'),
+                'score': daily_score,
+                'positive': pos,
+                'negative': neg,
+                'neutral': neu,
+            })
+
+        sentiment = {
+            'total_posts': total,
+            'positive': total_pos,
+            'negative': total_neg,
+            'neutral': total_neu,
+            'score': score,
+            'label': label,
+            'positive_pct': round(total_pos / total * 100, 1) if total > 0 else 0,
+            'negative_pct': round(total_neg / total * 100, 1) if total > 0 else 0,
+            'neutral_pct': round(total_neu / total * 100, 1) if total > 0 else 0,
+            'daily': daily,
+        }
+
+        # Company info
+        info = industry_classifier.get_ticker_info(ticker) or {}
+
+        # yfinance data
+        price_data = {}
+        try:
+            current = price_data_provider.get_current_price(ticker)
+            if current:
+                price_data['current_price'] = current.get('price')
+                price_data['change_today_pct'] = round(current.get('change_percent') or 0, 2)
+                price_data['market_state'] = current.get('market_state')
+        except: pass
+
+        try:
+            import yfinance as yf
+            stock = yf.Ticker(ticker)
+            # 30-day history to match sentiment period
+            hist = stock.history(period='35d', interval='1d')
+            if not hist.empty and len(hist) >= 2:
+                closes = hist['Close'].tolist()
+                dates = [str(d.date()) for d in hist.index]
+                # 7-day recent window
+                price_data['price_7d'] = [
+                    {'date': dates[i], 'close': round(closes[i], 2)}
+                    for i in range(max(0, len(closes)-7), len(closes))
+                ]
+                price_data['price_7d_change_pct'] = round((closes[-1] - closes[-8]) / closes[-8] * 100, 2) if len(closes) >= 8 else None
+                price_data['trend'] = 'uptrend' if closes[-1] > closes[max(0, len(closes)-8)] else ('downtrend' if closes[-1] < closes[max(0, len(closes)-8)] else 'flat')
+                # 30-day change (matches sentiment period)
+                price_30d_start = closes[0]
+                price_data['price_30d_change_pct'] = round((closes[-1] - price_30d_start) / price_30d_start * 100, 2)
+                price_data['price_30d_high'] = round(max(closes), 2)
+                price_data['price_30d_low'] = round(min(closes), 2)
+        except Exception as e:
+            print(f"[ticker-detail] history error for {ticker}: {e}")
+
+        try:
+            import yfinance as yf
+            yf_info = yf.Ticker(ticker).info
+            price_data['company_name'] = yf_info.get('longName') or yf_info.get('shortName', ticker)
+            price_data['sector'] = yf_info.get('sector')
+            price_data['industry'] = yf_info.get('industry')
+            price_data['market_cap'] = yf_info.get('marketCap')
+            price_data['pe_ratio'] = yf_info.get('trailingPE')
+            price_data['52w_high'] = yf_info.get('fiftyTwoWeekHigh')
+            price_data['52w_low'] = yf_info.get('fiftyTwoWeekLow')
+            hi = price_data.get('52w_high')
+            lo = price_data.get('52w_low')
+            price = price_data.get('current_price')
+            if hi and lo and price and (hi - lo) > 0:
+                price_data['52w_position_pct'] = round((price - lo) / (hi - lo) * 100, 1)
+        except: pass
+
+        # Fetch recent posts from DB for content analysis
+        recent_posts = []
+        try:
+            posts = db.posts.get_posts_filtered(ticker=ticker, limit=30)
+            for p in posts:
+                title = (p.get('title') or '').strip()
+                text = (p.get('text') or '').strip()
+                content = title if title else text[:150]
+                if content:
+                    recent_posts.append({
+                        'content': content[:150],
+                        'sentiment': p.get('sentiment_label'),
+                        'source': p.get('subreddit', ''),
+                        'date': str(p.get('created_at', ''))[:10],
+                        'url': p.get('url', ''),
+                    })
+        except Exception as e:
+            print(f"[ticker-detail] posts error: {e}")
+
+        return jsonify(success_response({
+            'ticker': ticker,
+            'company': info.get('company') or price_data.get('company_name', ticker),
+            'sector': info.get('sector') or price_data.get('sector', ''),
+            'industry': info.get('industry') or price_data.get('industry', ''),
+            'sentiment': sentiment,
+            'price': price_data,
+            'days': days,
+            'recent_posts': recent_posts,
+        }))
+    except Exception as e:
+        return jsonify(*error_response('DETAIL_ERROR', str(e), 500))
+
+# ── Scheduler Endpoints ───────────────────────────────────────────────────────
+
+@app.route('/api/v1/scheduler/status', methods=['GET'])
+def scheduler_status():
+    return jsonify(success_response({
+        'last_fetch': _last_auto_fetch,
+        'next_fetch': _next_auto_fetch,
+        'interval_hours': AUTO_FETCH_INTERVAL_HOURS,
+        'tickers': AUTO_FETCH_TICKERS,
+        'running': _scheduler is not None and _scheduler.running,
+    }))
+
+@app.route('/api/v1/scheduler/run-now', methods=['POST'])
+def scheduler_run_now():
+    """Manually trigger an immediate auto-fetch."""
+    import threading
+    t = threading.Thread(target=auto_fetch_all_tickers, daemon=True)
+    t.start()
+    return jsonify(success_response({'message': 'Auto-fetch started in background'}))
+
+# ── WhatsApp Endpoints ────────────────────────────────────────────────────────
+
+@app.route('/api/v1/whatsapp/status', methods=['GET'])
+def whatsapp_status():
+    wa_cfg = config.get('whatsapp', {})
+    return jsonify(success_response({
+        'enabled': wa_cfg.get('enabled', False),
+        'phone': wa_cfg.get('phone', ''),
+        'digest_hour': wa_cfg.get('digest_hour', 8),
+        'configured': whatsapp_service is not None,
+    }))
+
+@app.route('/api/v1/whatsapp/send-now', methods=['POST'])
+def whatsapp_send_now():
+    """Manually trigger a WhatsApp digest right now."""
+    if not whatsapp_service:
+        return jsonify(*error_response('WA_DISABLED', 'WhatsApp not configured', 503))
+    import threading
+    threading.Thread(target=send_whatsapp_digest, daemon=True).start()
+    return jsonify(success_response({'message': 'Digest sending in background'}))
+
+@app.route('/api/v1/whatsapp/test', methods=['POST'])
+def whatsapp_test():
+    """Send a test message to verify setup."""
+    if not whatsapp_service:
+        return jsonify(*error_response('WA_DISABLED', 'WhatsApp not configured', 503))
+    ok = whatsapp_service.send("✅ WhatsApp integration working! Your daily sentiment digest is configured.")
+    if ok:
+        return jsonify(success_response({'message': 'Test message sent'}))
+    return jsonify(*error_response('WA_FAILED', 'Failed to send message', 500))
+
+# ── AI Agent Endpoints ────────────────────────────────────────────────────────
+
+@app.route('/api/v1/agent/brief', methods=['GET'])
+def agent_brief():
+    """Auto-generate a market brief using the AI agent"""
+    if not agent_service:
+        return jsonify(*error_response('AGENT_DISABLED', 'AI Agent is not configured', 503))
+    try:
+        brief = agent_service.get_brief()
+        return jsonify(success_response({'brief': brief}))
+    except Exception as e:
+        return jsonify(*error_response('AGENT_ERROR', str(e), 500))
+
+@app.route('/api/v1/agent/chat', methods=['POST'])
+def agent_chat():
+    """Chat with the AI agent"""
+    if not agent_service:
+        return jsonify(*error_response('AGENT_DISABLED', 'AI Agent is not configured', 503))
+    try:
+        body = request.get_json() or {}
+        user_message = body.get('message', '').strip()
+        history = body.get('history', [])
+
+        if not user_message:
+            return jsonify(*error_response('INVALID_PARAM', 'message is required'))
+
+        response_text, updated_history = agent_service.chat(user_message, history)
+        return jsonify(success_response({
+            'response': response_text,
+            'history': updated_history
+        }))
+    except Exception as e:
+        return jsonify(*error_response('AGENT_ERROR', str(e), 500))
+
+@app.route('/api/v1/ticker-board', methods=['GET'])
+def get_ticker_board():
+    """Get sentiment summary for a list of tickers, sorted by score."""
+    try:
+        tickers_param = request.args.get('tickers', '')
+        days = int(request.args.get('days', 30))
+        if not tickers_param:
+            return jsonify(*error_response('INVALID_PARAM', 'tickers parameter required'))
+
+        tickers = [t.strip().upper() for t in tickers_param.split(',') if t.strip()]
+        board = []
+
+        for ticker in tickers:
+            trends = db.analytics.get_sentiment_trends(days=days, ticker=ticker)
+            total_pos = sum(t.get('positive', 0) for t in trends)
+            total_neg = sum(t.get('negative', 0) for t in trends)
+            total_neu = sum(t.get('neutral', 0) for t in trends)
+            total = total_pos + total_neg + total_neu
+
+            score = round((total_pos - total_neg) / total, 3) if total > 0 else None
+            if score is None:
+                label = 'no_data'
+            elif score > 0.1:
+                label = 'bullish'
+            elif score < -0.1:
+                label = 'bearish'
+            else:
+                label = 'neutral'
+
+            # Get company info from industry_classifier
+            info = industry_classifier.get_ticker_info(ticker) or {}
+
+            board.append({
+                'ticker': ticker,
+                'company': info.get('company', ticker),
+                'sector': info.get('sector', ''),
+                'total_posts': total,
+                'positive': total_pos,
+                'negative': total_neg,
+                'neutral': total_neu,
+                'score': score,
+                'label': label,
+            })
+
+        # Sort: bullish first (highest score), no_data last
+        board.sort(key=lambda x: (x['score'] is None, -(x['score'] or 0)))
+        return jsonify(success_response({'board': board, 'days': days}))
+    except Exception as e:
+        return jsonify(*error_response('BOARD_ERROR', str(e), 500))
 
 # Serve React App (SPA catch-all route)
 @app.route('/', defaults={'path': ''})

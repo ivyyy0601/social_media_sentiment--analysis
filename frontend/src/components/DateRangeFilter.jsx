@@ -1,4 +1,3 @@
-
 import React from 'react'
 
 function DateRangeFilter({ startDate, endDate, onStartDateChange, onEndDateChange, granularity, onGranularityChange }) {

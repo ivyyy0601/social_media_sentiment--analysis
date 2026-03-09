@@ -1,0 +1,52 @@
+
+{
+    "reddit": {
+      "subreddits": [
+        "stocks",
+        "StockMarket",
+        "investing",
+        "wallstreetbets",
+        "finance",
+        "options"
+      ],
+      "user_agent": "finance-sentiment-dashboard/2.0",
+      "default_query": "stocks OR finance OR investing OR trading",
+      "filter_patterns": {
+        "exclude_titles": [
+          "daily.*discussion",
+          "general.*discussion",
+          "advice.*thread",
+          "what.*are.*your.*moves",
+          "weekend.*discussion",
+          "discussion.*thread",
+          "daily.*thread"
+        ],
+        "exclude_keywords": [
+          "which niche",
+          "wanted to talk to but",
+          "career advice",
+          "networking",
+          "should i",
+          "how do i become",
+          "resume",
+          "job interview"
+        ]
+      }
+    },
+    "sentiment": {
+      "model": "ProsusAI/finbert",
+      "confidence_threshold": 0.6
+    },
+    "api": {
+      "version": "v1",
+      "default_page_size": 50,
+      "max_page_size": 1000
+    },
+    "server": {
+      "port": 5000,
+      "debug": true,
+      "cors_origins": ["http://localhost:5173", "http://localhost:3000"]
+    }
+  }
+  
+  

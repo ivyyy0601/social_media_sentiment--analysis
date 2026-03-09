@@ -71,13 +71,23 @@ class SentimentAnalyzer:
         # Get the dominant sentiment
         max_idx = np.argmax(predictions)
         label = self.labels[max_idx]
-        score = float(predictions[max_idx])
+        #score = float(predictions[max_idx])
+        confidence = float(predictions[max_idx])
 
+        # ⭐ NEW: signed sentiment score in [-1, 1]
+        signed_score = float(scores['positive'] - scores['negative'])
+
+        # return {
+        #     'label': label,
+        #     'score': score,
+        #     'scores': scores
+        # }
         return {
             'label': label,
-            'score': score,
+            'score': confidence,          # 仍然保留：置信度
+            'signed_score': signed_score, # ⭐ 新增：方向分数
             'scores': scores
-        }
+        }   
 
     def analyze_batch(self, texts):
         """

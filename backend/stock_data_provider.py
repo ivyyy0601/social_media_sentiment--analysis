@@ -106,55 +106,31 @@ class StockDataProvider:
         # List of popular tickers across different sectors
         popular_tickers = [
             # Technology
-            'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'META', 'NVDA', 'TSLA', 'AMD', 'INTC', 'ORCL',
-            'CSCO', 'ADBE', 'CRM', 'AVGO', 'QCOM', 'TXN', 'NFLX', 'PYPL', 'UBER', 'ABNB',
-            # Finance
-            'JPM', 'BAC', 'WFC', 'GS', 'MS', 'C', 'BLK', 'SCHW', 'AXP', 'COF',
+            "AAPL", "MSFT", "GOOGL", "GOOG", "NVDA", "META", "INTC", "AMD",
+            "CSCO", "ADBE", "CRM", "ORCL", "IBM", "QCOM", "TXN", "AVGO",
+            "NOW", "SNOW", "PLTR", "BB",
+            # Communication Services
+            "AMZN", "NFLX", "DIS", "CMCSA", "T", "VZ", "AMC",
+            # Financial
+            "JPM", "V", "BAC", "MA", "GS", "MS", "C", "WFC", "AXP",
+            "BRKB", "BLK", "SCHW", "COIN", "SQ", "PYPL", "SOFI",
             # Healthcare
-            'JNJ', 'UNH', 'PFE', 'ABBV', 'MRK', 'TMO', 'ABT', 'DHR', 'BMY', 'AMGN',
-            'CVS', 'CI', 'HUM', 'ELV', 'LLY',
-            # Consumer
-            'WMT', 'HD', 'MCD', 'NKE', 'SBUX', 'TGT', 'LOW', 'COST', 'TJX', 'DG',
+            "JNJ", "PFE", "UNH", "ABT", "TMO",
+            # Consumer Defensive
+            "WMT", "PG", "KO", "PEP",
+            # Consumer Cyclical
+            "TSLA", "HD", "MCD", "SBUX", "NKE", "GME",
+            "F", "GM", "RIVN", "LCID",
             # Energy
-            'XOM', 'CVX', 'COP', 'SLB', 'EOG', 'PSX', 'VLO', 'MPC', 'OXY', 'HAL',
-            # Industrial
-            'BA', 'HON', 'UPS', 'CAT', 'GE', 'MMM', 'LMT', 'RTX', 'DE', 'FDX',
-            # Telecom
-            'T', 'VZ', 'TMUS', 'DIS', 'CMCSA',
-            # Retail
-            'AMZN', 'WMT', 'COST', 'TGT', 'BBY', 'ETSY', 'EBAY',
-            # Automotive
-            'TSLA', 'F', 'GM', 'RIVN', 'LCID',
-            # Semiconductors
-            'NVDA', 'AMD', 'INTC', 'TSM', 'QCOM', 'AVGO', 'MU', 'AMAT', 'ADI', 'MRVL',
-            # Software
-            'MSFT', 'ORCL', 'CRM', 'ADBE', 'NOW', 'WDAY', 'TEAM', 'SNOW', 'DDOG', 'ZS',
-            # Banks
-            'JPM', 'BAC', 'WFC', 'C', 'USB', 'PNC', 'TFC', 'GS', 'MS', 'BK',
-            # Pharma
-            'PFE', 'JNJ', 'MRK', 'ABBV', 'LLY', 'BMY', 'GILD', 'AMGN', 'BIIB', 'REGN',
-            # E-commerce
-            'AMZN', 'SHOP', 'EBAY', 'ETSY', 'W',
-            # Social Media
-            'META', 'SNAP', 'PINS', 'TWTR',
-            # Streaming
-            'NFLX', 'DIS', 'PARA', 'WBD',
-            # Cloud
-            'AMZN', 'MSFT', 'GOOGL', 'ORCL', 'IBM',
-            # Cybersecurity
-            'CRWD', 'PANW', 'ZS', 'FTNT', 'S',
-            # Payment
-            'V', 'MA', 'PYPL', 'SQ', 'AXP',
-            # Biotech
-            'MRNA', 'BNTX', 'VRTX', 'ILMN', 'INCY',
+            "XOM", "CVX", "COP", "SLB",
+            # Industrials
+            "BA", "LMT", "CAT", "GE",
             # Real Estate
-            'AMT', 'PLD', 'CCI', 'EQIX', 'SPG',
+            "AMT", "PLD",
             # Utilities
-            'NEE', 'DUK', 'SO', 'D', 'AEP',
-            # Materials
-            'LIN', 'APD', 'ECL', 'SHW', 'NEM',
-            # Consumer Staples
-            'PG', 'KO', 'PEP', 'COST', 'WMT', 'MDLZ', 'CL', 'KMB', 'GIS', 'K'
+            "NEE", "DUK", "SO",
+            # ETF
+            "SPY", "QQQ",
         ]
         
         # Remove duplicates and limit

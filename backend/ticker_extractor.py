@@ -1,4 +1,3 @@
-
 import re
 import json
 import os
@@ -54,44 +53,36 @@ class TickerExtractor:
             return set()
     
     def extract_tickers(self, text):
-        """
-        Extract and normalize stock tickers from text
-        
-        Args:
-            text: Input text to extract tickers from
-            
-        Returns:
-            List of unique ticker symbols (normalized to uppercase)
-        """
         if not text:
             return []
-        
+
         tickers = set()
-        
-        # Pattern 1: Cashtags ($AAPL, $TSLA)
-        # Match $ followed by 1-5 uppercase letters at word boundary
-        cashtag_pattern = r'\$([A-Z]{1,5})\b'
-        cashtags = re.findall(cashtag_pattern, text)
-        tickers.update(cashtags)
-        
-        # Pattern 2: Standalone all-caps words (likely tickers)
-        # Match 1-5 uppercase letters with word boundaries on both sides
-        standalone_pattern = r'\b([A-Z]{1,5})\b'
-        candidates = re.findall(standalone_pattern, text)
-        
-        # Filter candidates: only include if in known tickers list and not in excluded words
-        for candidate in candidates:
-            if candidate not in self.EXCLUDED_WORDS and candidate in self.known_tickers:
-                tickers.add(candidate)
-        
-        # Pattern 3: Common ticker with dot notation (e.g., BRK.B)
-        dot_pattern = r'\b([A-Z]{2,4}\.[A-Z])\b'
-        dot_tickers = re.findall(dot_pattern, text)
-        for ticker in dot_tickers:
-            if ticker in self.known_tickers:
-                tickers.add(ticker)
-        
-        return sorted(list(tickers))
+
+        # Pattern 1: Cashtags ($AAPL, $tsla)
+        cashtag_pattern = r'\$([A-Za-z]{1,5})\b'
+        cashtags = [c.upper() for c in re.findall(cashtag_pattern, text)]
+        for sym in cashtags:
+            if sym in self.known_tickers:
+                tickers.add(sym)
+
+        # Pattern 2: Words 1-5 letters (case-insensitive), validate via known_tickers
+        word_pattern = r'\b([A-Za-z]{1,5})\b'
+        candidates = re.findall(word_pattern, text)
+        for c in candidates:
+            sym = c.upper()
+            # If it is a known ticker, accept it (known_tickers is the final authority)
+            if sym in self.known_tickers:
+                tickers.add(sym)
+
+        # Pattern 3: Dot notation (BRK.B)
+        dot_pattern = r'\b([A-Za-z]{2,4}\.[A-Za-z])\b'
+        dot_tickers = [t.upper() for t in re.findall(dot_pattern, text)]
+        for sym in dot_tickers:
+            if sym in self.known_tickers:
+                tickers.add(sym)
+
+        return sorted(tickers)
+
     
     def extract_with_context(self, text, context_chars=20):
         """

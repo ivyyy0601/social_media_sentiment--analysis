@@ -90,8 +90,8 @@ class PostRepository:
             cursor.execute('''
                 INSERT OR REPLACE INTO posts 
                 (id, reddit_id, url, subreddit, title, text, author, created_at, timezone,
-                 sentiment_label, sentiment_score, sentiment_scores, analyzed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sentiment_label, sentiment_score, sentiment_scores, sentiment_signed_score, analyzed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 post_data['id'],
                 reddit_id,
@@ -103,10 +103,12 @@ class PostRepository:
                 post_data['created_at'],
                 post_data.get('timezone', 'UTC'),
                 post_data['sentiment']['label'],
-                post_data['sentiment']['score'],
+                post_data['sentiment']['score'],  # 置信度
                 json.dumps(post_data['sentiment']['scores']),
+                post_data['sentiment'].get('signed_score', 0.0),  # ⭐方向分数
                 datetime.utcnow().isoformat()
             ))
+
             
             return post_data['id']
     
@@ -298,6 +300,7 @@ class PostRepository:
             'sentiment': {
                 'label': row['sentiment_label'],
                 'score': row['sentiment_score'],
+                'signed_score': row['sentiment_signed_score'],  # ⭐新增
                 'scores': json.loads(row['sentiment_scores']) if row['sentiment_scores'] else {}
             },
             'analyzed_at': row['analyzed_at']
@@ -692,139 +695,172 @@ class AnalyticsRepository:
                 trends[date][label] = count
             
             return list(trends.values())
-    
-    def get_market_pulse(self, start_date=None, end_date=None):
+        
+    def get_market_pulse(self, start_date=None, end_date=None, min_posts=3):
         """
         Get market pulse data (most discussed, most positive/negative stocks, etc.)
-        
-        Returns:
-            Dictionary with market overview metrics
+
+        Notes:
+        - sentiment_signed_score: direction score in [-1, 1] (positive - negative)
+        - sentiment_score: confidence (max prob). We DON'T use it for direction ranking.
         """
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            
+
             # Build date filter conditions and params
             where_conditions = ['1=1']
             params = []
-            
+
             if start_date:
                 where_conditions.append('p.created_at >= ?')
                 params.append(start_date)
-            
+
             if end_date:
                 where_conditions.append('p.created_at <= ?')
                 params.append(end_date)
-            
+
             where_clause = ' AND '.join(where_conditions)
-            
-            # Most discussed stocks
+
+            # -----------------------------
+            # 1) Most discussed stocks
+            # -----------------------------
             cursor.execute(f'''
-                SELECT t.symbol, COUNT(DISTINCT p.id) as post_count,
-                       AVG(p.sentiment_score) as avg_sentiment_score
+                SELECT
+                    t.symbol,
+                    COUNT(DISTINCT p.id) AS post_count,
+                    AVG(p.sentiment_signed_score) AS avg_sentiment_score
                 FROM tickers t
                 INNER JOIN post_tickers pt ON t.id = pt.ticker_id
                 INNER JOIN posts p ON pt.post_id = p.id
                 WHERE {where_clause}
+                AND p.sentiment_signed_score IS NOT NULL
                 GROUP BY t.symbol
                 ORDER BY post_count DESC
                 LIMIT 10
             ''', params)
-            
+
             most_discussed = [{
                 'ticker': row['symbol'],
                 'post_count': row['post_count'],
-                'avg_sentiment_score': round(row['avg_sentiment_score'], 2)
+                'avg_sentiment_score': round(row['avg_sentiment_score'], 2) if row['avg_sentiment_score'] is not None else None
             } for row in cursor.fetchall()]
-            
-            # Most positive stocks (minimum 3 posts)
+
+            # -----------------------------
+            # 2) Most positive stocks
+            #   - rank by avg signed score desc
+            #   - require at least min_posts
+            # -----------------------------
             cursor.execute(f'''
-                SELECT t.symbol, AVG(p.sentiment_score) as avg_sentiment,
-                       COUNT(DISTINCT p.id) as post_count
+                SELECT
+                    t.symbol,
+                    AVG(p.sentiment_signed_score) AS avg_sentiment,
+                    COUNT(DISTINCT p.id) AS post_count
                 FROM tickers t
                 INNER JOIN post_tickers pt ON t.id = pt.ticker_id
                 INNER JOIN posts p ON pt.post_id = p.id
-                WHERE p.sentiment_label = 'positive' AND {where_clause}
+                WHERE {where_clause}
+                AND p.sentiment_signed_score IS NOT NULL
                 GROUP BY t.symbol
-                HAVING post_count >= 3
+                HAVING  COUNT(DISTINCT p.id) >= ?
                 ORDER BY avg_sentiment DESC
                 LIMIT 10
-            ''', params)
-            
+            ''', params + [min_posts])
+
             most_positive = [{
                 'ticker': row['symbol'],
-                'avg_sentiment': round(row['avg_sentiment'], 2),
+                'avg_sentiment': round(row['avg_sentiment'], 2) if row['avg_sentiment'] is not None else None,
                 'post_count': row['post_count']
             } for row in cursor.fetchall()]
-            
-            # Most negative stocks (minimum 3 posts)
+
+            # -----------------------------
+            # 3) Most negative stocks
+            #   - rank by avg signed score asc
+            #   - require at least min_posts
+            # -----------------------------
             cursor.execute(f'''
-                SELECT t.symbol, AVG(p.sentiment_score) as avg_sentiment,
-                       COUNT(DISTINCT p.id) as post_count
+                SELECT
+                    t.symbol,
+                    AVG(p.sentiment_signed_score) AS avg_sentiment,
+                    COUNT(DISTINCT p.id) AS post_count
                 FROM tickers t
                 INNER JOIN post_tickers pt ON t.id = pt.ticker_id
                 INNER JOIN posts p ON pt.post_id = p.id
-                WHERE p.sentiment_label = 'negative' AND {where_clause}
+                WHERE {where_clause}
+                AND p.sentiment_signed_score IS NOT NULL
                 GROUP BY t.symbol
-                HAVING post_count >= 3
+                HAVING  COUNT(DISTINCT p.id) >= ?
                 ORDER BY avg_sentiment ASC
                 LIMIT 10
-            ''', params)
-            
+            ''', params + [min_posts])
+
             most_negative = [{
                 'ticker': row['symbol'],
-                'avg_sentiment': round(row['avg_sentiment'], 2),
+                'avg_sentiment': round(row['avg_sentiment'], 2) if row['avg_sentiment'] is not None else None,
                 'post_count': row['post_count']
             } for row in cursor.fetchall()]
-            
-            # Sentiment by sector
+
+            # -----------------------------
+            # 4) Sentiment by sector (counts)
+            #   这块你原来是按 sentiment_label 计数，保留
+            # -----------------------------
             cursor.execute(f'''
-                SELECT s.name as sector, p.sentiment_label,
-                       COUNT(DISTINCT p.id) as count
+                SELECT s.name AS sector, p.sentiment_label,
+                    COUNT(DISTINCT p.id) AS count
                 FROM sectors s
                 INNER JOIN post_sectors ps ON s.id = ps.sector_id
                 INNER JOIN posts p ON ps.post_id = p.id
                 WHERE {where_clause}
                 GROUP BY s.name, p.sentiment_label
             ''', params)
-            
+
             sentiment_by_sector = {}
             for row in cursor.fetchall():
                 sector = row['sector']
                 label = row['sentiment_label']
                 count = row['count']
-                
+
                 if sector not in sentiment_by_sector:
                     sentiment_by_sector[sector] = {'positive': 0, 'neutral': 0, 'negative': 0}
-                
+
                 sentiment_by_sector[sector][label] = count
-            
-            # Overall market sentiment
+
+            # -----------------------------
+            # 5) Overall market sentiment (direction + distribution)
+            #   - average_score 用 signed_score 的平均（方向）
+            #   - distribution 还是按 label 计数
+            # -----------------------------
             cursor.execute(f'''
-                SELECT AVG(sentiment_score) as avg_score,
-                       sentiment_label, COUNT(*) as count
-                FROM posts
+                SELECT
+                    AVG(p.sentiment_signed_score) AS avg_signed,
+                    p.sentiment_label,
+                    COUNT(*) AS count
+                FROM posts p
                 WHERE {where_clause}
-                GROUP BY sentiment_label
+                GROUP BY p.sentiment_label
             ''', params)
-            
+
             overall_sentiment = {
-                'average_score': 0,
+                'average_score': 0,  # 市场方向均值（signed）
                 'distribution': {'positive': 0, 'neutral': 0, 'negative': 0}
             }
-            
+
             total_posts = 0
             weighted_sum = 0
-            
+
             for row in cursor.fetchall():
                 label = row['sentiment_label']
                 count = row['count']
+                avg_signed = row['avg_signed']  # 该 label 内的 signed_score 平均
+
                 overall_sentiment['distribution'][label] = count
                 total_posts += count
-                weighted_sum += row['avg_score'] * count
-            
+
+                if avg_signed is not None:
+                    weighted_sum += avg_signed * count
+
             if total_posts > 0:
                 overall_sentiment['average_score'] = round(weighted_sum / total_posts, 2)
-            
+
             return {
                 'most_discussed_stocks': most_discussed,
                 'most_positive_stocks': most_positive,
@@ -832,7 +868,7 @@ class AnalyticsRepository:
                 'sentiment_by_sector': sentiment_by_sector,
                 'overall_market_sentiment': overall_sentiment
             }
-    
+
     def get_sentiment_by_ticker(self, tickers=None, start_date=None, end_date=None):
         """
         Get sentiment breakdown per ticker

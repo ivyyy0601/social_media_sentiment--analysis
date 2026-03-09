@@ -1,49 +1,82 @@
+
 {
-    "reddit": {
-      "subreddits": [
-        "stocks",
-        "StockMarket",
-        "investing",
-        "wallstreetbets",
-        "finance",
-        "options"
+  "auto_fetch": {
+    "interval_hours": 2,
+    "tickers": ["NVDA", "AAPL", "MSFT", "GOOG", "AMZN", "META", "TSLA", "AVGO", "TXN", "COHR", "INTC", "ASML", "SNDK"]
+  },
+  "whatsapp": {
+    "enabled": true,
+    "phone": "${WHATSAPP_PHONE}",
+    "api_key": "${WHATSAPP_APIKEY}",
+    "digest_hour": 8
+  },
+  "reddit": {
+    "subreddits": [
+      "stocks",
+      "StockMarket",
+      "investing",
+      "wallstreetbets",
+      "finance",
+      "ValueInvesting",
+      "pennystocks",
+      "ETFs",
+      "options",
+      "SecurityAnalysis",
+      "dividends",
+      "investing",
+      "Daytrading",
+      "algotrading",
+      "technicalanalysis"
+    ],
+    "user_agent": "finance-sentiment-dashboard/2.0",
+    "default_query": "stocks OR finance OR investing OR trading",
+    "filter_patterns": {
+      "exclude_titles": [
+        "daily.*discussion",
+        "general.*discussion",
+        "advice.*thread",
+        "what.*are.*your.*moves",
+        "weekend.*discussion",
+        "discussion.*thread",
+        "daily.*thread"
       ],
-      "user_agent": "finance-sentiment-dashboard/2.0",
-      "default_query": "stocks OR finance OR investing OR trading",
-      "filter_patterns": {
-        "exclude_titles": [
-          "daily.*discussion",
-          "general.*discussion",
-          "advice.*thread",
-          "what.*are.*your.*moves",
-          "weekend.*discussion",
-          "discussion.*thread",
-          "daily.*thread"
-        ],
-        "exclude_keywords": [
-          "which niche",
-          "wanted to talk to but",
-          "career advice",
-          "networking",
-          "should i",
-          "how do i become",
-          "resume",
-          "job interview"
-        ]
-      }
-    },
-    "sentiment": {
-      "model": "ProsusAI/finbert",
-      "confidence_threshold": 0.6
-    },
-    "api": {
-      "version": "v1",
-      "default_page_size": 50,
-      "max_page_size": 1000
-    },
-    "server": {
-      "port": 5000,
-      "debug": true,
-      "cors_origins": ["http://localhost:5173", "http://localhost:3000"]
+      "exclude_keywords": [
+        "which niche",
+        "wanted to talk to but",
+        "career advice",
+        "networking",
+        "should i",
+        "how do i become",
+        "resume",
+        "job interview"
+      ]
     }
+  },
+    "x": {
+      "bearer_token": "PASTE_YOUR_X_BEARER_TOKEN",
+      "default_query": "(AAPL OR MSFT OR GOOG OR AMZN OR NVDA OR TSLA OR META OR AVGO OR TXN OR COHR OR INTC OR ASML OR SNDK) lang:en -is:retweet",
+      "json_page_limit": 100,
+      "max_pages": 20,
+      "sleep_sec": 0.8,
+      "max_retries": 5
+    },
+  "sentiment": {
+    "model": "ProsusAI/finbert",
+    "confidence_threshold": 0.6
+  },
+  "api": {
+    "version": "v1",
+    "default_page_size": 50,
+    "max_page_size": 1000
+  },
+  "server": {
+    "port": 5000,
+    "debug": true,
+    "cors_origins": ["http://localhost:5173", "http://localhost:3000"]
+  },
+  "groq": {
+    "api_key": "${GROQ_API_KEY}",
+    "model": "llama-3.3-70b-versatile"
   }
+}
+
