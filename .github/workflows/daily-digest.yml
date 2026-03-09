@@ -1,0 +1,29 @@
+  name: Daily WhatsApp Digest                                                                                             
+                                                                                                                          
+  on:                                                                                                                     
+    schedule:                                                                                                             
+      - cron: '0 0 * * *'                                                                                                 
+    workflow_dispatch:                                                                                                    
+                                                                                                                          
+  jobs:
+    send-digest:                                                                                                          
+      runs-on: ubuntu-latest                                                                                              
+      steps:                                                                                                              
+        - name: Checkout code
+          uses: actions/checkout@v4
+
+        - name: Set up Python
+          uses: actions/setup-python@v5
+          with:
+            python-version: '3.11'
+
+        - name: Install dependencies
+          run: pip install yfinance requests
+
+        - name: Send daily digest
+          env:
+            GROQ_API_KEY:    ${{ secrets.GROQ_API_KEY }}
+            WHATSAPP_PHONE:  ${{ secrets.WHATSAPP_PHONE }}
+            WHATSAPP_APIKEY: ${{ secrets.WHATSAPP_APIKEY }}
+          run: python backend/github_digest.py
+
