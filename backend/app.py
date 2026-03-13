@@ -17,11 +17,29 @@ from api_utils import (
 )
 import os
 import json
-from datetime import datetime
+import requests
+from datetime import datetime, timedelta, timezone
+
+# Load .env file into environment variables
+try:
+    _env_path = os.path.join(os.path.dirname(__file__), '.env')
+    with open(_env_path) as _f:
+        for _line in _f:
+            _line = _line.strip()
+            if _line and not _line.startswith('#') and '=' in _line:
+                _k, _v = _line.split('=', 1)
+                os.environ.setdefault(_k.strip(), _v.strip())
+except Exception:
+    pass
 from alphavantage_news_client import AlphaVantageNewsClient
-from stocktwits_client import StockTwitsClient
 from yahoo_finance_news_client import YahooFinanceNewsClient
 from google_news_client import GoogleNewsClient
+from nasdaq_news_client import NasdaqNewsClient
+from seeking_alpha_client import SeekingAlphaClient
+from cnbc_news_client import CNBCNewsClient
+from sec_edgar_client import SECEdgarClient
+from motley_fool_client import MotleyFoolClient
+from hackernews_client import HackerNewsClient
 from apscheduler.schedulers.background import BackgroundScheduler
 from whatsapp_service import WhatsAppService
 
@@ -78,9 +96,14 @@ stock_data_provider = StockDataProvider()
 price_data_provider = PriceDataProvider()
 export_service = ExportService()
 watchlist_repo = WatchlistRepository()
-stocktwits_client = StockTwitsClient()
 yahoo_news_client = YahooFinanceNewsClient()
 google_news_client = GoogleNewsClient()
+nasdaq_news_client = NasdaqNewsClient()
+seeking_alpha_client = SeekingAlphaClient()
+cnbc_news_client = CNBCNewsClient()
+sec_edgar_client = SECEdgarClient()
+motley_fool_client = MotleyFoolClient()
+hackernews_client = HackerNewsClient()
 
 # WhatsApp service
 wa_cfg = config.get('whatsapp', {})
@@ -89,15 +112,15 @@ if wa_cfg.get('enabled') and wa_cfg.get('phone') and wa_cfg.get('api_key'):
     whatsapp_service = WhatsAppService(wa_cfg['phone'], wa_cfg['api_key'])
     print(f"[WhatsApp] Notifications enabled → {wa_cfg['phone']}")
 
-# AI Agent (Gemini)
-groq_cfg = config.get('groq', {})
-groq_api_key = groq_cfg.get('api_key', '')
-groq_model = groq_cfg.get('model', 'llama-3.3-70b-versatile')
+# AI Agent (Gemini 2.0 Flash)
+gemini_cfg = config.get('gemini', {})
+gemini_api_key = gemini_cfg.get('api_key', '')
+gemini_model = gemini_cfg.get('model', 'gemini-2.0-flash')
 agent_service = None
-if groq_api_key:
+if gemini_api_key:
     try:
-        agent_service = AgentService(db, price_data_provider, groq_api_key, groq_model, stock_data_provider)
-        print("AI Agent initialized (Groq)")
+        agent_service = AgentService(db, price_data_provider, gemini_api_key, gemini_model, stock_data_provider)
+        print("AI Agent initialized (Gemini 2.0 Flash)")
     except Exception as e:
         print(f"[WARN] AI Agent disabled: {e}")
 
@@ -112,12 +135,58 @@ _last_auto_fetch = None
 _next_auto_fetch = None
 
 
-def _process_and_save_post(post):
-    """Analyze sentiment and save a single post to DB."""
+GEMINI_POST_SCORE_PROMPT = """Rate the investment sentiment for {tickers} in this post.
+Score: -1.0 (very bearish) to +1.0 (very bullish) for {tickers} specifically.
+Focus on what the author thinks about {tickers} as an investment, not general market mood.
+Reply with ONLY a number like: 0.35"""
+
+def _gemini_score_post(text, tickers):
+    """Call Gemini to score a single post's sentiment for given tickers. Returns float or None."""
+    if not gemini_api_key or not tickers:
+        return None
+    try:
+        ticker_str = ', '.join(tickers[:3])
+        content = text[:600]
+        prompt = GEMINI_POST_SCORE_PROMPT.format(tickers=ticker_str, content=content)
+        # Add the actual post content to the prompt
+        full_prompt = prompt + f"\n\nPost: {content}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_api_key}"
+        payload = {
+            "contents": [{"parts": [{"text": full_prompt}]}],
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 20}
+        }
+        resp = requests.post(url, json=payload, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+        candidates = data.get('candidates', [])
+        if not candidates:
+            return None
+        parts = candidates[0].get('content', {}).get('parts', [])
+        if not parts:
+            return None
+        raw = parts[0].get('text', '').strip()
+        # Extract number from response
+        import re as _re
+        match = _re.search(r'-?\d+\.?\d*', raw)
+        if match:
+            score = float(match.group())
+            return max(-1.0, min(1.0, score))
+    except Exception as e:
+        print(f"[GeminiScore] Error: {e}")
+    return None
+
+
+def _process_and_save_post(post, force_ticker=None):
+    """Analyze sentiment and save a single post to DB. Skips if already exists."""
+    if db.posts.exists(post['id']):
+        return
     sentiment = sentiment_analyzer.analyze(post['text'])
     post['sentiment'] = sentiment
     post_id = db.posts.save_post(post)
     tickers_found = ticker_extractor.extract_tickers(post['text'])
+    # Always include the ticker we fetched for, even if not found in text
+    if force_ticker and force_ticker not in tickers_found:
+        tickers_found.append(force_ticker)
     classification = industry_classifier.classify_post_tickers(tickers_found)
     for t in tickers_found:
         info = industry_classifier.get_ticker_info(t) or {}
@@ -247,11 +316,6 @@ def auto_fetch_all_tickers():
             posts += reddit_client.fetch_posts(ticker, max_results=100)
         except Exception as e:
             print(f"[Scheduler] Reddit {ticker}: {e}")
-        # StockTwits
-        try:
-            posts += stocktwits_client.fetch_posts(ticker, limit=30)
-        except Exception as e:
-            print(f"[Scheduler] StockTwits {ticker}: {e}")
         # Yahoo Finance News
         try:
             posts += yahoo_news_client.fetch_posts(ticker, limit=30)
@@ -262,20 +326,77 @@ def auto_fetch_all_tickers():
             posts += google_news_client.fetch_posts(ticker, limit=40)
         except Exception as e:
             print(f"[Scheduler] GoogleNews {ticker}: {e}")
+        # Nasdaq News
+        try:
+            posts += nasdaq_news_client.fetch_posts(ticker, limit=20)
+        except Exception as e:
+            print(f"[Scheduler] NasdaqNews {ticker}: {e}")
+        # Seeking Alpha
+        try:
+            posts += seeking_alpha_client.fetch_posts(ticker, limit=20)
+        except Exception as e:
+            print(f"[Scheduler] SeekingAlpha {ticker}: {e}")
+        # CNBC
+        try:
+            posts += cnbc_news_client.fetch_posts(ticker, limit=20)
+        except Exception as e:
+            print(f"[Scheduler] CNBC {ticker}: {e}")
+        # SEC EDGAR 8-K filings
+        try:
+            posts += sec_edgar_client.fetch_posts(ticker, limit=10)
+        except Exception as e:
+            print(f"[Scheduler] SEC EDGAR {ticker}: {e}")
+        # Motley Fool
+        try:
+            posts += motley_fool_client.fetch_posts(ticker, limit=15)
+        except Exception as e:
+            print(f"[Scheduler] MotleyFool {ticker}: {e}")
+        # Hacker News
+        try:
+            posts += hackernews_client.fetch_posts(ticker, limit=20)
+        except Exception as e:
+            print(f"[Scheduler] HackerNews {ticker}: {e}")
 
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
         for post in posts:
             try:
-                _process_and_save_post(post)
+                raw_ts = post.get('created_at', '')
+                try:
+                    post_dt = datetime.fromisoformat(raw_ts.replace('Z', '+00:00'))
+                    if post_dt.tzinfo is None:
+                        post_dt = post_dt.replace(tzinfo=timezone.utc)
+                    if post_dt < cutoff:
+                        continue
+                except Exception:
+                    pass
+                _process_and_save_post(post, force_ticker=ticker)
                 total_new += 1
             except Exception:
                 pass
 
-    _last_auto_fetch = datetime.utcnow().isoformat()
-    from datetime import timedelta
+    _last_auto_fetch = datetime.now(timezone.utc).isoformat()
     _next_auto_fetch = (
-        datetime.utcnow() + timedelta(hours=AUTO_FETCH_INTERVAL_HOURS)
+        datetime.now(timezone.utc) + timedelta(hours=AUTO_FETCH_INTERVAL_HOURS)
     ).isoformat()
     print(f"[Scheduler] Done — processed {total_new} posts")
+    cleanup_old_posts()
+
+
+def cleanup_old_posts(keep_days=30):
+    """Delete posts older than keep_days from the database."""
+    try:
+        with db._get_connection() as conn:
+            cursor = conn.cursor()
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).strftime('%Y-%m-%dT%H:%M:%S')
+            cursor.execute("DELETE FROM post_tickers WHERE post_id IN (SELECT id FROM posts WHERE created_at < ?)", (cutoff,))
+            cursor.execute("DELETE FROM post_industries WHERE post_id IN (SELECT id FROM posts WHERE created_at < ?)", (cutoff,))
+            cursor.execute("DELETE FROM post_sectors WHERE post_id IN (SELECT id FROM posts WHERE created_at < ?)", (cutoff,))
+            cursor.execute("DELETE FROM posts WHERE created_at < ?", (cutoff,))
+            deleted = cursor.rowcount
+            if deleted > 0:
+                print(f"[Cleanup] Removed {deleted} posts older than {keep_days} days")
+    except Exception as e:
+        print(f"[Cleanup] Error: {e}")
 
 
 # Start the scheduler (skip in testing environments)
@@ -288,6 +409,15 @@ if not os.environ.get('DISABLE_SCHEDULER'):
             'interval',
             hours=AUTO_FETCH_INTERVAL_HOURS,
             id='auto_fetch',
+            replace_existing=True
+        )
+        # Daily cleanup — keep only last 30 days
+        _scheduler.add_job(
+            cleanup_old_posts,
+            'cron',
+            hour=2,
+            minute=0,
+            id='daily_cleanup',
             replace_existing=True
         )
         # Daily WhatsApp digest
@@ -311,7 +441,7 @@ def health_check_v1():
     """Health check endpoint"""
     return jsonify(success_response({
         'status': 'healthy',
-        'timestamp': datetime.utcnow().isoformat(),
+        'timestamp': datetime.now(timezone.utc).isoformat(),
         'version': 'v1'
     }))
 
@@ -387,19 +517,11 @@ def fetch_posts():
                 except Exception as e:
                     print(f"[WARN] News fetch failed: {e}")
 
-        # 3️⃣ StockTwits + Yahoo Finance News（只在 query 像单个 ticker 时才抓）
+        # 3️⃣ Yahoo Finance News + others（只在 query 像单个 ticker 时才抓）
         q = (query or "").strip().upper()
         is_single_ticker = q.isalnum() and 1 <= len(q) <= 5
 
         if is_single_ticker:
-            # StockTwits
-            try:
-                st_posts = stocktwits_client.fetch_posts(q, limit=30)
-                posts.extend(st_posts)
-                print(f"[StockTwits] {len(st_posts)} posts for {q}")
-            except Exception as e:
-                print(f"[WARN] StockTwits fetch failed: {e}")
-
             # Yahoo Finance News
             try:
                 yf_posts = yahoo_news_client.fetch_posts(q, limit=30)
@@ -416,6 +538,54 @@ def fetch_posts():
             except Exception as e:
                 print(f"[WARN] Google News fetch failed: {e}")
 
+            # Nasdaq News
+            try:
+                nd_posts = nasdaq_news_client.fetch_posts(q, limit=20)
+                posts.extend(nd_posts)
+                print(f"[NasdaqNews] {len(nd_posts)} posts for {q}")
+            except Exception as e:
+                print(f"[WARN] Nasdaq News fetch failed: {e}")
+
+            # Seeking Alpha
+            try:
+                sa_posts = seeking_alpha_client.fetch_posts(q, limit=20)
+                posts.extend(sa_posts)
+                print(f"[SeekingAlpha] {len(sa_posts)} posts for {q}")
+            except Exception as e:
+                print(f"[WARN] Seeking Alpha fetch failed: {e}")
+
+            # CNBC
+            try:
+                cnbc_posts = cnbc_news_client.fetch_posts(q, limit=20)
+                posts.extend(cnbc_posts)
+                print(f"[CNBC] {len(cnbc_posts)} posts for {q}")
+            except Exception as e:
+                print(f"[WARN] CNBC fetch failed: {e}")
+
+            # SEC EDGAR 8-K filings
+            try:
+                sec_posts = sec_edgar_client.fetch_posts(q, limit=10)
+                posts.extend(sec_posts)
+                print(f"[SEC EDGAR] {len(sec_posts)} filings for {q}")
+            except Exception as e:
+                print(f"[WARN] SEC EDGAR fetch failed: {e}")
+
+            # Motley Fool
+            try:
+                mf_posts = motley_fool_client.fetch_posts(q, limit=15)
+                posts.extend(mf_posts)
+                print(f"[MotleyFool] {len(mf_posts)} posts for {q}")
+            except Exception as e:
+                print(f"[WARN] Motley Fool fetch failed: {e}")
+
+            # Hacker News
+            try:
+                hn_posts = hackernews_client.fetch_posts(q, limit=20)
+                posts.extend(hn_posts)
+                print(f"[HackerNews] {len(hn_posts)} posts for {q}")
+            except Exception as e:
+                print(f"[WARN] Hacker News fetch failed: {e}")
+
         # 4) 去重（按 url 优先）
         seen = set()
         deduped = []
@@ -430,10 +600,31 @@ def fetch_posts():
 
         posts = deduped[:max_results]
 
+        # Filter out posts older than 30 days before saving
+        fetch_cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        filtered_posts = []
+        for p in posts:
+            try:
+                raw_ts = p.get('created_at', '')
+                post_dt = datetime.fromisoformat(raw_ts.replace('Z', '+00:00'))
+                if post_dt.tzinfo is None:
+                    post_dt = post_dt.replace(tzinfo=timezone.utc)
+                if post_dt < fetch_cutoff:
+                    continue
+            except Exception:
+                pass  # if date unparseable, skip the post entirely
+            filtered_posts.append(p)
+        posts = filtered_posts
+
         analyzed_posts = []
 
-
+        skipped = 0
         for post in posts:
+            # Skip posts already in DB — no need to re-run FinBERT
+            if db.posts.exists(post['id']):
+                skipped += 1
+                continue
+
             # Analyze sentiment
             sentiment = sentiment_analyzer.analyze(post['text'])
 
@@ -481,9 +672,11 @@ def fetch_posts():
                 'tickers': tickers
             })
 
+        print(f"[fetch-posts] new={len(analyzed_posts)} skipped={skipped} (already in DB)")
         return jsonify(success_response({
             'posts': analyzed_posts,
-            'count': len(analyzed_posts)
+            'count': len(analyzed_posts),
+            'skipped': skipped
         }))
     except Exception as e:
         print(f"Error fetching posts: {e}")
@@ -1062,7 +1255,7 @@ def get_ticker_detail(ticker):
         total_neg = sum(t.get('negative', 0) for t in trends)
         total_neu = sum(t.get('neutral', 0) for t in trends)
         total = total_pos + total_neg + total_neu
-        score = round((total_pos - total_neg) / total, 3) if total > 0 else None
+        score = round(sum(t.get('avg_signed_score', 0) * (t.get('positive',0)+t.get('negative',0)+t.get('neutral',0)) for t in trends) / total, 3) if total > 0 else None
         if score is None: label = 'no_data'
         elif score > 0.1: label = 'bullish'
         elif score < -0.1: label = 'bearish'
@@ -1074,11 +1267,9 @@ def get_ticker_detail(ticker):
             pos = t.get('positive', 0)
             neg = t.get('negative', 0)
             neu = t.get('neutral', 0)
-            tot = pos + neg + neu
-            daily_score = round((pos - neg) / tot, 3) if tot > 0 else None
             daily.append({
                 'date': t.get('date'),
-                'score': daily_score,
+                'score': t.get('avg_signed_score'),
                 'positive': pos,
                 'negative': neg,
                 'neutral': neu,
@@ -1112,24 +1303,39 @@ def get_ticker_detail(ticker):
 
         try:
             import yfinance as yf
+            from datetime import date as _date
             stock = yf.Ticker(ticker)
-            # 30-day history to match sentiment period
-            hist = stock.history(period='35d', interval='1d')
-            if not hist.empty and len(hist) >= 2:
-                closes = hist['Close'].tolist()
-                dates = [str(d.date()) for d in hist.index]
-                # 7-day recent window
-                price_data['price_7d'] = [
-                    {'date': dates[i], 'close': round(closes[i], 2)}
-                    for i in range(max(0, len(closes)-7), len(closes))
-                ]
-                price_data['price_7d_change_pct'] = round((closes[-1] - closes[-8]) / closes[-8] * 100, 2) if len(closes) >= 8 else None
-                price_data['trend'] = 'uptrend' if closes[-1] > closes[max(0, len(closes)-8)] else ('downtrend' if closes[-1] < closes[max(0, len(closes)-8)] else 'flat')
-                # 30-day change (matches sentiment period)
-                price_30d_start = closes[0]
-                price_data['price_30d_change_pct'] = round((closes[-1] - price_30d_start) / price_30d_start * 100, 2)
-                price_data['price_30d_high'] = round(max(closes), 2)
-                price_data['price_30d_low'] = round(min(closes), 2)
+            # Use same calendar-day cutoff as sentiment: now - timedelta(days=days)
+            # Buffer: extra 15 days + half of days to safely cover weekends/holidays
+            fetch_buf = days + max(15, days // 2)
+            hist = stock.history(period=f'{fetch_buf}d', interval='1d')
+            if not hist.empty:
+                hist_dates = [d.date() for d in hist.index]
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date()
+
+                # Chart data: all closes on or after the cutoff (matches sentiment window)
+                window_rows = [(str(hist_dates[i]), round(float(hist['Close'].iloc[i]), 2))
+                               for i in range(len(hist_dates)) if hist_dates[i] >= cutoff]
+                price_data['price_7d'] = [{'date': d, 'close': c} for d, c in window_rows]
+
+                # start_close: last close ON OR BEFORE cutoff (same as sentiment start boundary)
+                before = [float(hist['Close'].iloc[i]) for i in range(len(hist_dates)) if hist_dates[i] <= cutoff]
+                start_close = before[-1] if before else float(hist['Close'].iloc[0])
+
+                # current price: use real-time price from yfinance info when available
+                # (hist['Close'].iloc[-1] is yesterday's close when market is open)
+                current_price = price_data.get('current_price') or float(hist['Close'].iloc[-1])
+
+                price_data['price_7d_change_pct'] = round((current_price - start_close) / start_close * 100, 2) if start_close else None
+                price_data['trend'] = (
+                    'uptrend' if current_price > start_close else
+                    'downtrend' if current_price < start_close else 'flat'
+                )
+                # Use actual High/Low columns for period range
+                window_idx = [i for i in range(len(hist_dates)) if hist_dates[i] >= cutoff]
+                if window_idx:
+                    price_data['period_high'] = round(float(hist['High'].iloc[window_idx].max()), 2)
+                    price_data['period_low'] = round(float(hist['Low'].iloc[window_idx].min()), 2)
         except Exception as e:
             print(f"[ticker-detail] history error for {ticker}: {e}")
 
@@ -1153,17 +1359,36 @@ def get_ticker_detail(ticker):
         # Fetch recent posts from DB for content analysis
         recent_posts = []
         try:
-            posts = db.posts.get_posts_filtered(ticker=ticker, limit=30)
+            posts = db.posts.get_posts_filtered(ticker=ticker, limit=60)
+            seen_titles = set()
             for p in posts:
                 title = (p.get('title') or '').strip()
                 text = (p.get('text') or '').strip()
                 content = title if title else text[:150]
-                if content:
-                    recent_posts.append({
-                        'content': content[:150],
-                        'sentiment': p.get('sentiment_label'),
-                        'source': p.get('subreddit', ''),
-                        'date': str(p.get('created_at', ''))[:10],
+                if not content:
+                    continue
+                # Deduplicate by normalized title (catches Yahoo/Google duplicates)
+                norm = ''.join(content.lower().split())[:80]
+                if norm in seen_titles:
+                    continue
+                seen_titles.add(norm)
+
+                # Resolve source: prefer source column, fall back to subreddit
+                raw_source = p.get('source') or p.get('subreddit') or ''
+                if raw_source in ('', None) or raw_source.startswith('r/') or raw_source in (
+                    'stocks', 'StockMarket', 'investing', 'wallstreetbets', 'finance',
+                    'ValueInvesting', 'pennystocks', 'ETFs', 'options', 'SecurityAnalysis',
+                    'dividends', 'Daytrading', 'algotrading', 'technicalanalysis'
+                ):
+                    source = 'reddit'
+                else:
+                    source = raw_source
+
+                recent_posts.append({
+                    'content': content[:150],
+                    'sentiment': p.get('sentiment_label'),
+                    'source': source,
+                    'date': str(p.get('created_at', ''))[:10],
                         'url': p.get('url', ''),
                     })
         except Exception as e:
@@ -1233,6 +1458,369 @@ def whatsapp_test():
         return jsonify(success_response({'message': 'Test message sent'}))
     return jsonify(*error_response('WA_FAILED', 'Failed to send message', 500))
 
+# ── Sentiment Lab Endpoints ───────────────────────────────────────────────────
+
+@app.route('/api/v1/lab/method-comparison', methods=['GET'])
+def lab_method_comparison():
+    """Compare 4 sentiment score methods across all tickers."""
+    days = int(request.args.get('days', 7))
+    tickers_param = request.args.get('tickers', '')
+    ticker_list = [t.strip().upper() for t in tickers_param.split(',') if t.strip()] if tickers_param else None
+
+    try:
+        with db._get_connection() as conn:
+            cursor = conn.cursor()
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%S')
+
+            ticker_filter = ''
+            params = [cutoff]
+            if ticker_list:
+                placeholders = ','.join('?' * len(ticker_list))
+                ticker_filter = f'AND t.symbol IN ({placeholders})'
+                params.extend(ticker_list)
+
+            cursor.execute(f'''
+                SELECT t.symbol,
+                  COUNT(*) as total_posts,
+                  SUM(CASE WHEN p.sentiment_label='positive' THEN 1 ELSE 0 END) as pos_count,
+                  SUM(CASE WHEN p.sentiment_label='negative' THEN 1 ELSE 0 END) as neg_count,
+                  SUM(CASE WHEN p.sentiment_label='neutral'  THEN 1 ELSE 0 END) as neu_count,
+                  AVG(p.sentiment_signed_score) as avg_signed,
+                  AVG(CASE WHEN p.sentiment_score > 0.7 THEN p.sentiment_signed_score END) as high_conf_signed,
+                  AVG(p.sentiment_score) as avg_confidence
+                FROM posts p
+                JOIN post_tickers pt ON p.id = pt.post_id
+                JOIN tickers t ON pt.ticker_id = t.id
+                WHERE p.created_at >= ? {ticker_filter}
+                GROUP BY t.symbol
+                HAVING total_posts >= 5
+                ORDER BY avg_signed DESC
+            ''', params)
+
+            rows = cursor.fetchall()
+            if not rows:
+                return jsonify(success_response({'rows': [], 'stats': {}}))
+
+            # Compute z-score across tickers
+            scores = [r['avg_signed'] or 0 for r in rows]
+            mean_s = sum(scores) / len(scores)
+            variance = sum((s - mean_s) ** 2 for s in scores) / len(scores)
+            std_s = variance ** 0.5 if variance > 0 else 1
+
+            result = []
+            for r in rows:
+                avg = r['avg_signed'] or 0
+                total = r['total_posts']
+                method_a = round((r['pos_count'] - r['neg_count']) / total, 4) if total > 0 else 0
+                method_b = round(avg, 4)
+                method_c = round(r['high_conf_signed'] or 0, 4)
+                method_d = round((avg - mean_s) / std_s, 4) if std_s > 0 else 0
+
+                def label(score, z=False):
+                    if z:
+                        return 'bullish' if score > 0.5 else ('bearish' if score < -0.5 else 'neutral')
+                    return 'bullish' if score > 0.05 else ('bearish' if score < -0.03 else 'neutral')
+
+                result.append({
+                    'ticker': r['symbol'],
+                    'total_posts': total,
+                    'pos': r['pos_count'], 'neg': r['neg_count'], 'neu': r['neu_count'],
+                    'avg_confidence': round(r['avg_confidence'] or 0, 3),
+                    'method_a': method_a, 'label_a': label(method_a),
+                    'method_b': method_b, 'label_b': label(method_b),
+                    'method_c': method_c, 'label_c': label(method_c),
+                    'method_d': method_d, 'label_d': label(method_d, z=True),
+                })
+
+            return jsonify(success_response({
+                'rows': result,
+                'days': days,
+                'stats': {'mean': round(mean_s, 4), 'std': round(std_s, 4), 'n_tickers': len(result)}
+            }))
+    except Exception as e:
+        return jsonify(*error_response('LAB_ERROR', str(e), 500))
+
+
+@app.route('/api/v1/lab/backtest', methods=['GET'])
+def lab_backtest():
+    """Daily sentiment vs price movement for a ticker."""
+    ticker = request.args.get('ticker', 'NVDA').upper()
+    days = int(request.args.get('days', 30))
+
+    try:
+        import yfinance as yf
+        from datetime import timedelta as td
+
+        cutoff = (datetime.now(timezone.utc) - td(days=days)).strftime('%Y-%m-%dT%H:%M:%S')
+
+        with db._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT DATE(p.created_at) as day,
+                  AVG(p.sentiment_signed_score) as avg_signed,
+                  COUNT(*) as posts,
+                  SUM(CASE WHEN p.sentiment_label='positive' THEN 1 ELSE 0 END) as pos,
+                  SUM(CASE WHEN p.sentiment_label='negative' THEN 1 ELSE 0 END) as neg
+                FROM posts p
+                JOIN post_tickers pt ON p.id = pt.post_id
+                JOIN tickers t ON pt.ticker_id = t.id
+                WHERE t.symbol = ? AND p.created_at >= ?
+                GROUP BY day ORDER BY day ASC
+            ''', (ticker, cutoff))
+            sentiment_rows = {r['day']: dict(r) for r in cursor.fetchall()}
+
+        # Get price history
+        hist = yf.Ticker(ticker).history(period=f'{days + 5}d', interval='1d')
+        price_data = {}
+        closes = list(zip([str(d.date()) for d in hist.index], hist['Close'].tolist()))
+        for i in range(1, len(closes)):
+            date, close = closes[i]
+            prev_close = closes[i-1][1]
+            price_data[date] = {
+                'close': round(close, 2),
+                'price_change_pct': round((close - prev_close) / prev_close * 100, 3)
+            }
+
+        # Merge: sentiment day → next day's price change (1-day lag)
+        daily = []
+        sent_dates = sorted(sentiment_rows.keys())
+        for i, date in enumerate(sent_dates):
+            s = sentiment_rows[date]
+            # same day price change
+            p_same = price_data.get(date, {})
+            # next trading day price change
+            next_dates = [d for d in sorted(price_data.keys()) if d > date]
+            p_next = price_data.get(next_dates[0], {}) if next_dates else {}
+
+            daily.append({
+                'date': date,
+                'sentiment': round(s['avg_signed'] or 0, 4),
+                'posts': s['posts'],
+                'pos': s['pos'], 'neg': s['neg'],
+                'price_close': p_same.get('close'),
+                'price_change_pct': p_same.get('price_change_pct'),
+                'next_day_price_change_pct': p_next.get('price_change_pct'),
+            })
+
+        # Correlation stats
+        pairs_same = [(d['sentiment'], d['price_change_pct']) for d in daily if d['price_change_pct'] is not None]
+        pairs_lag1 = [(d['sentiment'], d['next_day_price_change_pct']) for d in daily if d['next_day_price_change_pct'] is not None]
+
+        def pearson(pairs):
+            if len(pairs) < 3:
+                return None
+            xs = [p[0] for p in pairs]
+            ys = [p[1] for p in pairs]
+            mx, my = sum(xs)/len(xs), sum(ys)/len(ys)
+            num = sum((x-mx)*(y-my) for x,y in zip(xs,ys))
+            den = (sum((x-mx)**2 for x in xs) * sum((y-my)**2 for y in ys)) ** 0.5
+            return round(num/den, 4) if den > 0 else None
+
+        # Conditional average: when bullish/bearish next day price
+        bull_days = [d['next_day_price_change_pct'] for d in daily if d['sentiment'] > 0.05 and d['next_day_price_change_pct'] is not None]
+        bear_days = [d['next_day_price_change_pct'] for d in daily if d['sentiment'] < -0.03 and d['next_day_price_change_pct'] is not None]
+        neut_days = [d['next_day_price_change_pct'] for d in daily if -0.03 <= d['sentiment'] <= 0.05 and d['next_day_price_change_pct'] is not None]
+
+        return jsonify(success_response({
+            'ticker': ticker,
+            'days': days,
+            'daily': daily,
+            'correlation': {
+                'same_day': pearson(pairs_same),
+                'lag_1_day': pearson(pairs_lag1),
+            },
+            'conditional_avg_next_day': {
+                'when_bullish': round(sum(bull_days)/len(bull_days), 3) if bull_days else None,
+                'when_bearish': round(sum(bear_days)/len(bear_days), 3) if bear_days else None,
+                'when_neutral': round(sum(neut_days)/len(neut_days), 3) if neut_days else None,
+                'n_bullish_days': len(bull_days),
+                'n_bearish_days': len(bear_days),
+                'n_neutral_days': len(neut_days),
+            }
+        }))
+    except Exception as e:
+        return jsonify(*error_response('BACKTEST_ERROR', str(e), 500))
+
+
+@app.route('/api/v1/lab/distribution', methods=['GET'])
+def lab_distribution():
+    """Histogram of signed_score distribution by source."""
+    days = int(request.args.get('days', 30))
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%S')
+        with db._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT source, sentiment_signed_score, sentiment_label, sentiment_score
+                FROM posts
+                WHERE created_at >= ?
+            ''', (cutoff,))
+            rows = cursor.fetchall()
+
+        buckets = [-1.0, -0.8, -0.6, -0.4, -0.2, -0.05, 0.05, 0.2, 0.4, 0.6, 0.8, 1.01]
+        bucket_labels = ['<-0.8','-0.8~-0.6','-0.6~-0.4','-0.4~-0.2','-0.2~-0.05','Near 0','0~0.2','0.2~0.4','0.4~0.6','0.6~0.8','>0.8']
+
+        hist = [0] * len(bucket_labels)
+        by_source = {}
+
+        for r in rows:
+            score = r['sentiment_signed_score'] or 0
+            src = r['source'] or 'reddit'
+            for i in range(len(buckets)-1):
+                if buckets[i] <= score < buckets[i+1]:
+                    hist[i] += 1
+                    break
+            if src not in by_source:
+                by_source[src] = {'count': 0, 'avg_signed': 0, '_sum': 0}
+            by_source[src]['count'] += 1
+            by_source[src]['_sum'] += score
+
+        for src in by_source:
+            n = by_source[src]['count']
+            by_source[src]['avg_signed'] = round(by_source[src]['_sum'] / n, 4) if n > 0 else 0
+            del by_source[src]['_sum']
+
+        total = len(rows)
+        return jsonify(success_response({
+            'days': days,
+            'total_posts': total,
+            'histogram': [{'bucket': bucket_labels[i], 'count': hist[i], 'pct': round(hist[i]*100/total, 1) if total else 0} for i in range(len(bucket_labels))],
+            'by_source': by_source,
+            'overall_avg': round(sum(r['sentiment_signed_score'] or 0 for r in rows) / total, 4) if total else 0,
+            'overall_std': round((sum((r['sentiment_signed_score'] or 0 - sum(r['sentiment_signed_score'] or 0 for r in rows)/total)**2 for r in rows)/total)**0.5, 4) if total > 1 else 0,
+        }))
+    except Exception as e:
+        return jsonify(*error_response('DIST_ERROR', str(e), 500))
+
+
+# ── Gemini Leaderboard ────────────────────────────────────────────────────────
+
+GEMINI_SENTIMENT_PROMPT = """You are a financial sentiment analyst specializing in stock-specific sentiment.
+
+Read the posts below about {ticker} and assess: how do people feel about {ticker} AS AN INVESTMENT?
+
+Important rules:
+- A post can be negative in tone (e.g. "markets are scary") but BULLISH on {ticker} (e.g. "but {ticker} will outperform") — score it positive
+- A post can be positive in tone but BEARISH on {ticker} — score it negative
+- Only score sentiment that is DIRECTLY about {ticker}'s stock, business, or investment prospects
+- Ignore general market/macro sentiment unless the author links it to {ticker} specifically
+
+Score from -1.0 (extremely bearish on {ticker}) to +1.0 (extremely bullish on {ticker}), 0.0 = neutral.
+
+Posts:
+{posts}
+
+Reply with only this JSON (no markdown, no explanation outside the JSON):
+{{"score": 0.35, "label": "bullish", "reason": "max 8 words why"}}
+label must be: bullish, neutral, or bearish"""
+
+
+@app.route('/api/v1/gemini-board', methods=['GET'])
+def gemini_board():
+    """Leaderboard using Gemini to score sentiment instead of FinBERT."""
+    import json as _json
+    import re
+
+    if not gemini_api_key:
+        return jsonify(*error_response('GEMINI_DISABLED', 'Gemini API key not configured', 503))
+
+    tickers_param = request.args.get('tickers', '')
+    days = int(request.args.get('days', 7))
+    ticker_list = [t.strip().upper() for t in tickers_param.split(',') if t.strip()]
+    if not ticker_list:
+        ticker_list = ['NVDA', 'AAPL', 'MSFT', 'GOOG', 'AMZN', 'META', 'TSLA', 'AVGO', 'TXN', 'COHR', 'INTC', 'ASML', 'SNDK']
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%S')
+    results = []
+
+    for ticker in ticker_list:
+        try:
+            # Fetch recent posts for this ticker from DB
+            with db._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute('''
+                    SELECT p.title, p.text, p.source, p.sentiment_signed_score
+                    FROM posts p
+                    JOIN post_tickers pt ON p.id = pt.post_id
+                    JOIN tickers t ON pt.ticker_id = t.id
+                    WHERE t.symbol = ? AND p.created_at >= ?
+                    ORDER BY p.created_at DESC
+                    LIMIT 30
+                ''', (ticker, cutoff))
+                rows = cursor.fetchall()
+
+            if not rows:
+                results.append({
+                    'ticker': ticker, 'score': None, 'label': 'no_data',
+                    'reason': 'No posts found', 'total_posts': 0,
+                    'finbert_score': None,
+                })
+                continue
+
+            # Build post text for Gemini
+            post_lines = []
+            finbert_scores = []
+            for r in rows:
+                title = (r['title'] or '').strip()
+                text = (r['text'] or '').strip()[:200]
+                content = title if title else text
+                if content:
+                    src = r['source'] or 'reddit'
+                    post_lines.append(f"[{src}] {content}")
+                if r['sentiment_signed_score'] is not None:
+                    finbert_scores.append(r['sentiment_signed_score'])
+
+            posts_text = '\n'.join(post_lines[:25])
+            finbert_avg = round(sum(finbert_scores) / len(finbert_scores), 4) if finbert_scores else None
+
+            # Call Gemini
+            prompt = GEMINI_SENTIMENT_PROMPT.format(ticker=ticker, posts=posts_text)
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_api_key}"
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "maxOutputTokens": 1024
+                }
+            }
+            resp = requests.post(url, json=payload, timeout=30)
+            resp.raise_for_status()
+            raw = resp.json()['candidates'][0]['content']['parts'][0]['text'].strip()
+            print(f"[GeminiBoard] {ticker} raw: {raw[:400]}")
+
+            # Strip markdown code fences then parse JSON
+            cleaned = re.sub(r'```(?:json)?', '', raw).strip('` \n')
+            match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+            try:
+                parsed = _json.loads(match.group()) if match else {}
+            except Exception:
+                parsed = {}
+
+            score = float(parsed.get('score', 0))
+            score = max(-1.0, min(1.0, score))  # clamp
+            label = parsed.get('label', 'neutral')
+            reason = parsed.get('reason', '')
+
+            results.append({
+                'ticker': ticker,
+                'score': round(score, 4),
+                'label': label,
+                'reason': reason,
+                'total_posts': len(rows),
+                'finbert_score': finbert_avg,
+            })
+
+        except Exception as e:
+            results.append({
+                'ticker': ticker, 'score': None, 'label': 'no_data',
+                'reason': str(e), 'total_posts': 0, 'finbert_score': None,
+            })
+
+    # Sort by score descending
+    results.sort(key=lambda x: (x['score'] is not None, x['score'] or 0), reverse=True)
+    return jsonify(success_response({'board': results, 'days': days}))
+
+
 # ── AI Agent Endpoints ────────────────────────────────────────────────────────
 
 @app.route('/api/v1/agent/brief', methods=['GET'])
@@ -1245,6 +1833,221 @@ def agent_brief():
         return jsonify(success_response({'brief': brief}))
     except Exception as e:
         return jsonify(*error_response('AGENT_ERROR', str(e), 500))
+
+@app.route('/api/v1/agent/stock-analysis', methods=['GET'])
+def agent_stock_analysis():
+    """Generate a full AI analysis for a specific stock"""
+    if not agent_service:
+        return jsonify(*error_response('AGENT_DISABLED', 'AI Agent is not configured', 503))
+    ticker = request.args.get('ticker', '').upper().strip()
+    days_param = int(request.args.get('days', 7))
+    if not ticker:
+        return jsonify(*error_response('INVALID_PARAM', 'ticker parameter required'))
+    try:
+        analysis = agent_service.get_stock_analysis(ticker, days=days_param)
+        return jsonify(success_response({'ticker': ticker, 'analysis': analysis}))
+    except Exception as e:
+        return jsonify(*error_response('AGENT_ERROR', str(e), 500))
+
+@app.route('/api/v1/agent/db-analysis', methods=['POST'])
+def agent_db_analysis():
+    """Deep analysis of DB data for a given time period or custom question."""
+    if not agent_service:
+        return jsonify(*error_response('AGENT_DISABLED', 'AI Agent is not configured', 503))
+    try:
+        body = request.get_json() or {}
+        period = body.get('period', '7days')
+        question = body.get('question', '').strip()
+        history = body.get('history', [])
+        ticker = (body.get('ticker', '') or '').upper().strip()
+
+        period_map = {'today': 1, 'yesterday': 2, '3days': 3, '7days': 7, '30days': 30, 'week': 7, 'month': 30}
+        days = period_map.get(period, 7)
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%S')
+
+        with db._get_connection() as conn:
+            cursor = conn.cursor()
+
+            if ticker:
+                # Ticker-specific queries
+                cursor.execute('''
+                    SELECT DATE(p.created_at) as day,
+                        COUNT(*) as total,
+                        SUM(CASE WHEN p.sentiment_label='positive' THEN 1 ELSE 0 END) as pos,
+                        SUM(CASE WHEN p.sentiment_label='negative' THEN 1 ELSE 0 END) as neg,
+                        AVG(p.sentiment_signed_score) as avg_score
+                    FROM posts p
+                    JOIN post_tickers pt ON p.id = pt.post_id
+                    JOIN tickers t ON pt.ticker_id = t.id
+                    WHERE t.symbol = ? AND p.created_at >= ?
+                    GROUP BY day ORDER BY day DESC
+                ''', (ticker, cutoff))
+                daily = [dict(r) for r in cursor.fetchall()]
+
+                cursor.execute('''
+                    SELECT p.title, p.text, p.source, p.sentiment_label, p.sentiment_signed_score, p.created_at
+                    FROM posts p
+                    JOIN post_tickers pt ON p.id = pt.post_id
+                    JOIN tickers t ON pt.ticker_id = t.id
+                    WHERE t.symbol = ? AND p.created_at >= ?
+                    ORDER BY ABS(p.sentiment_signed_score) DESC LIMIT 40
+                ''', (ticker, cutoff))
+                cursor2_rows = cursor.fetchall()
+
+                cursor.execute('''
+                    SELECT p.source, COUNT(*) as count, AVG(p.sentiment_signed_score) as avg_score
+                    FROM posts p
+                    JOIN post_tickers pt ON p.id = pt.post_id
+                    JOIN tickers t ON pt.ticker_id = t.id
+                    WHERE t.symbol = ? AND p.created_at >= ?
+                    GROUP BY p.source ORDER BY count DESC
+                ''', (ticker, cutoff))
+                by_source = [dict(r) for r in cursor.fetchall()]
+                top_tickers = []
+            else:
+                # Market-wide queries
+                cursor.execute('''
+                    SELECT DATE(created_at) as day,
+                        COUNT(*) as total,
+                        SUM(CASE WHEN sentiment_label='positive' THEN 1 ELSE 0 END) as pos,
+                        SUM(CASE WHEN sentiment_label='negative' THEN 1 ELSE 0 END) as neg,
+                        AVG(sentiment_signed_score) as avg_score
+                    FROM posts WHERE created_at >= ?
+                    GROUP BY day ORDER BY day DESC
+                ''', (cutoff,))
+                daily = [dict(r) for r in cursor.fetchall()]
+
+                cursor.execute('''
+                    SELECT t.symbol,
+                        COUNT(DISTINCT p.id) as posts,
+                        AVG(p.sentiment_signed_score) as avg_score
+                    FROM tickers t
+                    JOIN post_tickers pt ON t.id = pt.ticker_id
+                    JOIN posts p ON pt.post_id = p.id
+                    WHERE p.created_at >= ?
+                    GROUP BY t.symbol
+                    ORDER BY posts DESC LIMIT 15
+                ''', (cutoff,))
+                top_tickers = [dict(r) for r in cursor.fetchall()]
+
+                cursor.execute('''
+                    SELECT title, text, source, sentiment_label, sentiment_signed_score, created_at
+                    FROM posts WHERE created_at >= ?
+                    ORDER BY ABS(sentiment_signed_score) DESC LIMIT 40
+                ''', (cutoff,))
+                cursor2_rows = cursor.fetchall()
+
+                cursor.execute('''
+                    SELECT source, COUNT(*) as count, AVG(sentiment_signed_score) as avg_score
+                    FROM posts WHERE created_at >= ?
+                    GROUP BY source ORDER BY count DESC
+                ''', (cutoff,))
+                by_source = [dict(r) for r in cursor.fetchall()]
+
+            sample_posts = []
+            for r in cursor2_rows:
+                title = (r['title'] or '').strip()
+                text = (r['text'] or '').strip()[:120]
+                content = title if title else text
+                if content:
+                    sample_posts.append({
+                        'content': content,
+                        'source': r['source'],
+                        'sentiment': r['sentiment_label'],
+                        'score': round(r['sentiment_signed_score'] or 0, 3),
+                        'date': str(r['created_at'])[:10]
+                    })
+
+            total_posts = sum(d['total'] for d in daily)
+
+        period_label = {'today': '1天', 'yesterday': '2天', '3days': '3天', '7days': '7天', '30days': '30天', 'week': '7天', 'month': '30天'}.get(period, period)
+        subject = f"{ticker} 股票" if ticker else "整体市场"
+
+        db_context = {
+            'subject': subject,
+            'period': period_label,
+            'total_posts_in_db': total_posts,
+            'daily_trend': daily,
+            'source_breakdown': by_source,
+            'most_impactful_posts_sample': sample_posts,
+        }
+        if not ticker:
+            db_context['top_tickers'] = top_tickers
+
+        has_data = total_posts > 0
+
+        db_summary = f"数据库数据（{subject}，{period_label}，共{total_posts}条帖子）：\n{json.dumps(db_context, ensure_ascii=False, indent=2, default=str)}"
+
+        if question:
+            # Follow-up: focused answer to specific question
+            prompt = f"""你是一位专业金融情感分析师。以下是数据库数据供参考：
+
+{db_summary}
+
+用户问题：{question}
+
+请直接回答这个问题。如果数据库没有足够信息，结合你的市场知识补充。回答要具体、简洁。
+⚠️ 不构成投资建议。"""
+        else:
+            # Initial analysis: full structured report
+            prompt = f"""你是一位专业金融情感分析师。以下是从本地数据库提取的{period_label} {subject}社交媒体和新闻数据：
+
+{db_summary}
+
+{"请基于以上数据做详细分析。" if has_data else f"数据库中该时间段内帖子数量不足（仅{total_posts}条），数据库分析受限，请结合你的市场知识补充。"}
+
+请按以下结构回答：
+
+**1. 整体情感概况**
+- 该时间段内整体情绪：偏多/偏空/中性？给出数据支撑
+- 每天情绪变化趋势，哪天最活跃/最极端？
+
+**2. 热点话题**
+{"- 讨论量最高的股票是哪些？情绪如何？" if not ticker else f"- 关于 {ticker} 帖子在讨论什么主题？"}
+- 从帖子内容可以看出，最近在关注什么主题？（如：AI、关税、财报、宏观等）
+
+**3. 情绪波动分析**
+- 是否有某天情绪出现明显异常？可能的原因是什么？
+- 最强烈的正面/负面内容在讲什么？
+
+**4. 来源分析**
+- 不同来源（Reddit/新闻/StockTwits）的情绪倾向有差异吗？
+
+**5. 总结与补充**
+- {"基于以上数据库数据，给出你的核心判断。" if has_data else "数据库数据不足，"}结合你自身的市场知识，补充该时间段内实际发生的重要事件、新闻、宏观因素。
+- 最终给出综合判断。
+
+⚠️ 数据来源：本地社交媒体情感数据库 + AI市场知识库。不构成投资建议。"""
+
+        # Build conversation for Gemini directly (don't use agent_service.chat which rebuilds context)
+        contents = []
+        for msg in history:
+            role = 'user' if msg['role'] == 'user' else 'model'
+            contents.append({'role': role, 'parts': [{'text': msg['content']}]})
+        contents.append({'role': 'user', 'parts': [{'text': prompt}]})
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={gemini_api_key}"
+        payload = {
+            'contents': contents,
+            'generationConfig': {'temperature': 0.7, 'maxOutputTokens': 8192}
+        }
+        resp = requests.post(url, json=payload, timeout=60)
+        resp.raise_for_status()
+        response_text = resp.json()['candidates'][0]['content']['parts'][0]['text']
+
+        updated_history = history + [
+            {'role': 'user', 'content': question if question else f'分析{period_label}{subject}数据'},
+            {'role': 'assistant', 'content': response_text}
+        ]
+
+        return jsonify(success_response({
+            'response': response_text,
+            'history': updated_history,
+            'db_stats': {'total_posts': total_posts, 'days': days, 'period': period_label}
+        }))
+    except Exception as e:
+        return jsonify(*error_response('AGENT_ERROR', str(e), 500))
+
 
 @app.route('/api/v1/agent/chat', methods=['POST'])
 def agent_chat():
@@ -1286,7 +2089,7 @@ def get_ticker_board():
             total_neu = sum(t.get('neutral', 0) for t in trends)
             total = total_pos + total_neg + total_neu
 
-            score = round((total_pos - total_neg) / total, 3) if total > 0 else None
+            score = round(sum(t.get('avg_signed_score', 0) * (t.get('positive',0)+t.get('negative',0)+t.get('neutral',0)) for t in trends) / total, 3) if total > 0 else None
             if score is None:
                 label = 'no_data'
             elif score > 0.1:
@@ -1316,6 +2119,67 @@ def get_ticker_board():
         return jsonify(success_response({'board': board, 'days': days}))
     except Exception as e:
         return jsonify(*error_response('BOARD_ERROR', str(e), 500))
+
+@app.route('/api/v1/ai-ticker-board', methods=['GET'])
+def ai_ticker_board():
+    """Leaderboard using Gemini ai_sentiment_score stored in DB."""
+    tickers_param = request.args.get('tickers', '')
+    days = int(request.args.get('days', 7))
+    ticker_list = [t.strip().upper() for t in tickers_param.split(',') if t.strip()]
+    if not ticker_list:
+        ticker_list = ['NVDA', 'AAPL', 'MSFT', 'GOOG', 'AMZN', 'META', 'TSLA', 'AVGO', 'TXN', 'COHR', 'INTC', 'ASML', 'SNDK']
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%S')
+
+    board = []
+    try:
+        with db._get_connection() as conn:
+            cursor = conn.cursor()
+            placeholders = ','.join('?' * len(ticker_list))
+            cursor.execute(f'''
+                SELECT t.symbol,
+                    COUNT(DISTINCT p.id) as total_posts,
+                    COUNT(DISTINCT CASE WHEN p.ai_sentiment_score IS NOT NULL THEN p.id END) as ai_scored,
+                    AVG(p.ai_sentiment_score) as avg_ai_score,
+                    AVG(p.sentiment_signed_score) as avg_finbert_score
+                FROM tickers t
+                JOIN post_tickers pt ON t.id = pt.ticker_id
+                JOIN posts p ON pt.post_id = p.id
+                WHERE t.symbol IN ({placeholders}) AND p.created_at >= ?
+                GROUP BY t.symbol
+            ''', ticker_list + [cutoff])
+
+            rows = cursor.fetchall()
+            ticker_data = {r['symbol']: r for r in rows}
+
+        for ticker in ticker_list:
+            r = ticker_data.get(ticker)
+            if not r or r['ai_scored'] == 0:
+                board.append({
+                    'ticker': ticker,
+                    'score': None,
+                    'label': 'no_data',
+                    'total_posts': r['total_posts'] if r else 0,
+                    'ai_scored_posts': 0,
+                    'finbert_score': round(r['avg_finbert_score'], 4) if r and r['avg_finbert_score'] is not None else None,
+                })
+                continue
+
+            score = round(r['avg_ai_score'], 4)
+            label = 'bullish' if score > 0.1 else ('bearish' if score < -0.1 else 'neutral')
+            board.append({
+                'ticker': ticker,
+                'score': score,
+                'label': label,
+                'total_posts': r['total_posts'],
+                'ai_scored_posts': r['ai_scored'],
+                'finbert_score': round(r['avg_finbert_score'], 4) if r['avg_finbert_score'] is not None else None,
+            })
+
+        board.sort(key=lambda x: (x['score'] is not None, x['score'] or 0), reverse=True)
+        return jsonify(success_response({'board': board, 'days': days}))
+    except Exception as e:
+        return jsonify(*error_response('AI_BOARD_ERROR', str(e), 500))
 
 # Serve React App (SPA catch-all route)
 @app.route('/', defaults={'path': ''})

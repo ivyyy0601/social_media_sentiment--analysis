@@ -13,7 +13,7 @@ class StockTwitsClient:
     def __init__(self, limit=30):
         self.limit = limit
         self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "finance-sentiment-dashboard/1.0"})
+        self.session.headers.update({"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"})
 
     def fetch_posts(self, ticker: str, limit: int = None) -> list:
         """
@@ -25,7 +25,15 @@ class StockTwitsClient:
         url = self.BASE_URL.format(ticker=ticker)
 
         try:
-            resp = self.session.get(url, params={"limit": min(limit, 30)}, timeout=10)
+            # Use a fresh session each time to avoid being blocked
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept": "application/json",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://stocktwits.com/",
+            })
+            resp = session.get(url, params={"limit": min(limit, 30)}, timeout=10)
             if resp.status_code == 429:
                 print(f"[StockTwits] Rate limited for {ticker}")
                 return []
@@ -44,11 +52,12 @@ class StockTwitsClient:
 
                 created_raw = msg.get("created_at", "")
                 try:
-                    created_at = datetime.fromisoformat(
+                    dt = datetime.fromisoformat(
                         created_raw.replace("Z", "+00:00")
-                    ).isoformat()
+                    )
+                    created_at = dt.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
                 except Exception:
-                    created_at = datetime.now(timezone.utc).isoformat()
+                    created_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
 
                 username = msg.get("user", {}).get("username", "unknown")
                 msg_id = str(msg.get("id", ""))

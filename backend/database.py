@@ -88,10 +88,10 @@ class PostRepository:
             reddit_id = post_data.get('reddit_id', post_data.get('id', '').replace('reddit_', ''))
             
             cursor.execute('''
-                INSERT OR REPLACE INTO posts 
+                INSERT OR REPLACE INTO posts
                 (id, reddit_id, url, subreddit, title, text, author, created_at, timezone,
-                sentiment_label, sentiment_score, sentiment_scores, sentiment_signed_score, analyzed_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sentiment_label, sentiment_score, sentiment_scores, sentiment_signed_score, analyzed_at, source, ai_sentiment_score)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 post_data['id'],
                 reddit_id,
@@ -103,15 +103,32 @@ class PostRepository:
                 post_data['created_at'],
                 post_data.get('timezone', 'UTC'),
                 post_data['sentiment']['label'],
-                post_data['sentiment']['score'],  # 置信度
+                post_data['sentiment']['score'],
                 json.dumps(post_data['sentiment']['scores']),
-                post_data['sentiment'].get('signed_score', 0.0),  # ⭐方向分数
-                datetime.utcnow().isoformat()
+                post_data['sentiment'].get('signed_score', 0.0),
+                datetime.utcnow().isoformat(),
+                post_data.get('source', ''),
+                post_data.get('ai_sentiment_score')
             ))
 
             
             return post_data['id']
-    
+
+    def exists(self, post_id):
+        """Return True if a post with this ID is already in the database."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT 1 FROM posts WHERE id = ? LIMIT 1', (post_id,))
+            return cursor.fetchone() is not None
+
+    def update_ai_score(self, post_id, score):
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'UPDATE posts SET ai_sentiment_score = ? WHERE id = ?',
+                (score, post_id)
+            )
+
     def get_recent_posts(self, limit=50, offset=0):
         """
         Get recent analyzed posts
@@ -287,6 +304,10 @@ class PostRepository:
     
     def _row_to_post(self, row):
         """Convert database row to post dictionary"""
+        try:
+            ai_score = row['ai_sentiment_score']
+        except (IndexError, KeyError):
+            ai_score = None
         return {
             'id': row['id'],
             'reddit_id': row['reddit_id'],
@@ -303,7 +324,8 @@ class PostRepository:
                 'signed_score': row['sentiment_signed_score'],  # ⭐新增
                 'scores': json.loads(row['sentiment_scores']) if row['sentiment_scores'] else {}
             },
-            'analyzed_at': row['analyzed_at']
+            'analyzed_at': row['analyzed_at'],
+            'ai_sentiment_score': ai_score
         }
 
 
@@ -632,7 +654,8 @@ class AnalyticsRepository:
                 date_format = "DATE(created_at)"
             
             query = f'''
-                SELECT {date_format} as date, sentiment_label, COUNT(*) as count
+                SELECT {date_format} as date, sentiment_label, COUNT(*) as count,
+                       AVG(sentiment_signed_score) as avg_signed
                 FROM posts p
             '''
             
@@ -668,7 +691,8 @@ class AnalyticsRepository:
                 params.append(start_date)
             elif not end_date:
                 # Use days parameter if no date range specified
-                cutoff_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+                from datetime import timezone as _tz
+                cutoff_date = (datetime.now(_tz.utc) - timedelta(days=days)).strftime('%Y-%m-%dT%H:%M:%S')
                 conditions.append('p.created_at >= ?')
                 params.append(cutoff_date)
             
@@ -688,13 +712,26 @@ class AnalyticsRepository:
                 date = row['date']
                 label = row['sentiment_label']
                 count = row['count']
-                
+                avg_signed = row['avg_signed'] or 0.0
+
                 if date not in trends:
-                    trends[date] = {'date': date, 'positive': 0, 'negative': 0, 'neutral': 0}
-                
+                    trends[date] = {
+                        'date': date, 'positive': 0, 'negative': 0, 'neutral': 0,
+                        '_signed_sum': 0.0, '_total': 0
+                    }
+
                 trends[date][label] = count
-            
-            return list(trends.values())
+                trends[date]['_signed_sum'] += avg_signed * count
+                trends[date]['_total'] += count
+
+            # Add avg_signed_score per day and clean up temp fields
+            result = []
+            for d in trends.values():
+                total = d.pop('_total', 0)
+                signed_sum = d.pop('_signed_sum', 0.0)
+                d['avg_signed_score'] = round(signed_sum / total, 4) if total > 0 else 0.0
+                result.append(d)
+            return result
         
     def get_market_pulse(self, start_date=None, end_date=None, min_posts=3):
         """

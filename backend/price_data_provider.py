@@ -6,28 +6,13 @@ Uses yfinance for comprehensive price data.
 import yfinance as yf
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-import requests_cache
-from requests import Session
 
 
 class PriceDataProvider:
-    """Provides stock price data from yfinance with caching"""
-    
+    """Provides stock price data from yfinance"""
+
     def __init__(self, cache_expire_minutes=15):
-        """
-        Initialize price data provider with caching
-        
-        Args:
-            cache_expire_minutes: Minutes to cache price data (default 15)
-        """
         self.cache_expire_minutes = cache_expire_minutes
-        
-        # Setup caching for requests
-        self.session = requests_cache.CachedSession(
-            'price_cache',
-            backend='memory',
-            expire_after=timedelta(minutes=cache_expire_minutes)
-        )
     
     def get_current_price(self, ticker: str) -> Optional[Dict]:
         """
@@ -40,7 +25,7 @@ class PriceDataProvider:
             Dictionary with current price data or None
         """
         try:
-            stock = yf.Ticker(ticker, session=self.session)
+            stock = yf.Ticker(ticker)
             info = stock.info
             
             # Get fast info for current price
@@ -91,7 +76,7 @@ class PriceDataProvider:
             List of historical price dictionaries or None
         """
         try:
-            stock = yf.Ticker(ticker, session=self.session)
+            stock = yf.Ticker(ticker)
             hist = stock.history(start=start_date, end=end_date, interval=interval)
             
             if hist.empty:
@@ -157,7 +142,7 @@ class PriceDataProvider:
             start = datetime.strptime(date, '%Y-%m-%d')
             end = start + timedelta(days=5)
             
-            stock = yf.Ticker(ticker, session=self.session)
+            stock = yf.Ticker(ticker)
             hist = stock.history(start=start.strftime('%Y-%m-%d'), end=end.strftime('%Y-%m-%d'))
             
             if not hist.empty:
@@ -171,9 +156,4 @@ class PriceDataProvider:
             return None
     
     def clear_cache(self):
-        """Clear the price data cache"""
-        try:
-            self.session.cache.clear()
-            print("Price cache cleared")
-        except Exception as e:
-            print(f"Error clearing cache: {e}")
+        pass

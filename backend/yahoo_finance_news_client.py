@@ -50,9 +50,9 @@ class YahooFinanceNewsClient:
 
                 # Parse publish date
                 try:
-                    created_at = parsedate_to_datetime(pub_date).isoformat()
+                    created_at = parsedate_to_datetime(pub_date).astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
                 except Exception:
-                    created_at = datetime.now(timezone.utc).isoformat()
+                    created_at = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')
 
                 # Combine title + description as text
                 text = title

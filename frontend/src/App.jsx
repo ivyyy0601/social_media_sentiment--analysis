@@ -18,6 +18,9 @@ import WatchlistPanel from './components/WatchlistPanel'
 import FetchControls from './components/FetchControls'
 import AIAnalyst from './components/AIAnalyst'
 import TickerBoard from './components/TickerBoard'
+import SentimentLab from './components/SentimentLab'
+import TickerBoardGemini from './components/TickerBoardGemini'
+import TickerBoardAI from './components/TickerBoardAI'
 
 function App() {
   const [posts, setPosts] = useState([])
@@ -356,6 +359,24 @@ function App() {
         >
           🤖 AI Analyst
         </button>
+        <button
+          className={`tab ${activeView === 'lab' ? 'active' : ''}`}
+          onClick={() => setActiveView('lab')}
+        >
+          🔬 Sentiment Lab
+        </button>
+        <button
+          className={`tab ${activeView === 'gemini_board' ? 'active' : ''}`}
+          onClick={() => setActiveView('gemini_board')}
+        >
+          🤖 Leaderboard 2
+        </button>
+        <button
+          className={`tab ${activeView === 'ai_board' ? 'active' : ''}`}
+          onClick={() => setActiveView('ai_board')}
+        >
+          🤖 AI Leaderboard
+        </button>
       </div>
 
       {/* Content based on active view */}
@@ -393,6 +414,18 @@ function App() {
 
       {activeView === 'ai' && (
         <AIAnalyst apiBase={API_BASE} />
+      )}
+
+      {activeView === 'lab' && (
+        <SentimentLab apiBase={API_BASE} />
+      )}
+
+      {activeView === 'gemini_board' && (
+        <TickerBoardGemini apiBase={API_BASE} />
+      )}
+
+      {activeView === 'ai_board' && (
+        <TickerBoardAI apiBase={API_BASE} />
       )}
     </div>
   )

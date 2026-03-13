@@ -8,7 +8,7 @@ class DatabaseMigration:
     """Handle database schema migrations"""
 
     VERSION_TABLE = 'schema_version'
-    CURRENT_VERSION = 4  # Version 3 includes watchlist tables # Version 4 adds sentiment_signed_score
+    CURRENT_VERSION = 5  # Version 3 includes watchlist tables # Version 4 adds sentiment_signed_score # Version 5 adds ai_sentiment_score
     
     def __init__(self, db_path='finance_sentiment.db'):
         """
@@ -89,20 +89,26 @@ class DatabaseMigration:
         current_version = self.get_current_version()
 
         if current_version == 0:
-            print("Initializing new database with schema version 4...")
-            self._create_v4_schema()
+            print("Initializing new database with schema version 5...")
+            self._create_v5_schema()
         elif current_version == 1:
-            print("Migrating database from version 1 to 4...")
+            print("Migrating database from version 1 to 5...")
             self._migrate_v1_to_v2()
             self._migrate_v2_to_v3()
             self._migrate_v3_to_v4()
+            self._migrate_v4_to_v5()
         elif current_version == 2:
-            print("Migrating database from version 2 to 4...")
+            print("Migrating database from version 2 to 5...")
             self._migrate_v2_to_v3()
             self._migrate_v3_to_v4()
+            self._migrate_v4_to_v5()
         elif current_version == 3:
-            print("Migrating database from version 3 to 4...")
+            print("Migrating database from version 3 to 5...")
             self._migrate_v3_to_v4()
+            self._migrate_v4_to_v5()
+        elif current_version == 4:
+            print("Migrating database from version 4 to 5...")
+            self._migrate_v4_to_v5()
         elif current_version == self.CURRENT_VERSION:
             print("Database is already at current version")
         else:
@@ -508,6 +514,33 @@ class DatabaseMigration:
             # Update schema version to 4
             cursor.execute(f'UPDATE {self.VERSION_TABLE} SET version = ?', (4,))
             print("Database migrated to version 4 successfully")
+
+    def _migrate_v4_to_v5(self):
+        """Migrate from version 4 to version 5 (add ai_sentiment_score column)"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Check existing columns
+            cursor.execute("PRAGMA table_info(posts)")
+            columns = {row['name'] for row in cursor.fetchall()}
+
+            if 'ai_sentiment_score' not in columns:
+                cursor.execute("ALTER TABLE posts ADD COLUMN ai_sentiment_score REAL")
+                print("Added column ai_sentiment_score to posts table")
+            else:
+                print("Column ai_sentiment_score already exists")
+
+            # Update schema version to 5
+            cursor.execute(f'UPDATE {self.VERSION_TABLE} SET version = ?', (5,))
+            print("Database migrated to version 5 successfully")
+
+    def _create_v5_schema(self):
+        """Create complete version 5 schema from scratch"""
+        # create v4 schema first
+        self._create_v4_schema()
+
+        # then add v5 changes
+        self._migrate_v4_to_v5()
 
     def _create_v4_schema(self):
         """Create complete version 4 schema from scratch"""

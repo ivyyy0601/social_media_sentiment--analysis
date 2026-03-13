@@ -13,8 +13,9 @@ class RedditRSSClient:
 
     def __init__(self, config_path='config.json'):
         config = self._load_config(config_path)
-        self.subreddits = config.get('subreddits', ['stocks', 'investing', 'wallstreetbets', 'finance'])
-        self.user_agent = config.get('user_agent', 'finance-sentiment-rss/0.1')
+        self.subreddits = config.get('subreddits', ['stocks', 'investing', 'wallstreetbets', 'options', 'finance'])
+        self.ticker_subreddits = config.get('ticker_subreddits', {})
+        self.user_agent = config.get('user_agent', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36')
         self.default_query = config.get('default_query', 'stocks OR finance OR investing')
         self.base_url = 'https://www.reddit.com'
         
@@ -133,20 +134,31 @@ class RedditRSSClient:
         search_query = query or self.default_query
         headers = {'User-Agent': self.user_agent}
 
-        collected = []
-        per_sub_limit = max(1, min(50, max_results // max(len(self.subreddits), 1) + 1))
+        # If query looks like a ticker, also include ticker-specific subreddits
+        ticker_upper = (query or '').strip().upper()
+        extra_subs = self.ticker_subreddits.get(ticker_upper, [])
+        all_subreddits = list(self.subreddits) + [s for s in extra_subs if s not in self.subreddits]
 
-        for sub in self.subreddits or ['stocks', 'investing']:
+        collected = []
+        per_sub_limit = max(1, min(50, max_results // max(len(all_subreddits), 1) + 1))
+
+        for sub in all_subreddits or ['stocks', 'investing']:
             if len(collected) >= max_results:
                 break
 
-            url = f"{self.base_url}/r/{sub}/search.rss"
-            params = {
-                'q': search_query,
-                'restrict_sr': 'on',
-                'sort': 'new',
-                'limit': per_sub_limit,
-            }
+            # For ticker-specific subreddits, fetch the full feed (already focused)
+            # For general subreddits, search within them
+            if sub in extra_subs:
+                url = f"{self.base_url}/r/{sub}/new.rss"
+                params = {'limit': min(25, per_sub_limit)}
+            else:
+                url = f"{self.base_url}/r/{sub}/search.rss"
+                params = {
+                    'q': search_query,
+                    'restrict_sr': 'on',
+                    'sort': 'new',
+                    'limit': per_sub_limit,
+                }
             
             # Add time filter if dates are specified
             if start_date or end_date:
@@ -195,14 +207,16 @@ class RedditRSSClient:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=tz.UTC)
             
-            # Get timezone name
+            # Get timezone name before converting to UTC
             tzname = dt.tzname() or 'UTC'
-            
-            return dt.isoformat(), tzname
+
+            # Normalize to UTC for consistent SQLite string comparison
+            dt_utc = dt.astimezone(tz.UTC)
+            return dt_utc.strftime('%Y-%m-%dT%H:%M:%S'), tzname
         except Exception:
             # Fallback to current UTC time
             now = datetime.now(tz.UTC)
-            return now.isoformat(), 'UTC'
+            return now.strftime('%Y-%m-%dT%H:%M:%S'), 'UTC'
     
     def _parse_feed(self, content, subreddit):
         """

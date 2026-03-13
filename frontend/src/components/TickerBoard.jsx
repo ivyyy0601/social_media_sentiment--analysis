@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import axios from 'axios'
 import TickerAnalysisPanel from './TickerAnalysisPanel'
 
@@ -14,6 +14,7 @@ function TickerBoard({ apiBase, onTickerSelect }) {
   const [lastUpdated, setLastUpdated] = useState(null)
   const [schedulerStatus, setSchedulerStatus] = useState(null)
   const [autoRunning, setAutoRunning] = useState(false)
+  const daysRef = useRef(days)
 
   const loadBoard = useCallback(async (d = days) => {
     try {
@@ -44,7 +45,7 @@ function TickerBoard({ apiBase, onTickerSelect }) {
       // Poll board until data updates (max 60s)
       for (let i = 0; i < 12; i++) {
         await new Promise(r => setTimeout(r, 5000))
-        await loadBoard(days)
+        await loadBoard(daysRef.current)
         await loadSchedulerStatus()
       }
     } catch (e) {
@@ -87,6 +88,7 @@ function TickerBoard({ apiBase, onTickerSelect }) {
   }
 
   const handleDaysChange = (d) => {
+    daysRef.current = d
     setDays(d)
     loadBoard(d)
   }
@@ -129,12 +131,18 @@ function TickerBoard({ apiBase, onTickerSelect }) {
         </div>
         <div className="ticker-board-controls">
           <div className="days-selector">
-            {[7, 30, 90].map(d => (
+            {[
+              { d: 1,  label: '1天'  },
+              { d: 2,  label: '2天'  },
+              { d: 3,  label: '3天'  },
+              { d: 7,  label: '7天'  },
+              { d: 30, label: '30天' },
+            ].map(({ d, label }) => (
               <button
                 key={d}
                 className={`days-btn ${days === d ? 'active' : ''}`}
                 onClick={() => handleDaysChange(d)}
-              >{d}d</button>
+              >{label}</button>
             ))}
           </div>
           <button
@@ -239,6 +247,7 @@ function TickerBoard({ apiBase, onTickerSelect }) {
       {selectedTicker && (
         <TickerAnalysisPanel
           ticker={selectedTicker}
+          days={days}
           apiBase={apiBase}
           onClose={() => setSelectedTicker(null)}
           onViewDashboard={onTickerSelect ? (t) => onTickerSelect(t) : null}
